@@ -57,17 +57,21 @@ func (s *scheduler) worker() {
 }
 
 // enqueue 将 RunID 推入队列。队列满时丢弃并记录日志（应通过增大队列避免）。
+//
+// 注意：检查 stopped 标志与向 queue 发送必须在同一把 stopMu 临界区内完成，
+// 否则 stop() 可能在二者之间 close(s.queue)，导致本方法向已关闭的 channel
+// 发送而 panic。
 func (s *scheduler) enqueue(runID model.RunID) {
 	s.stopMu.Lock()
+	defer s.stopMu.Unlock()
 	if s.stopped {
-		s.stopMu.Unlock()
 		return
 	}
-	s.stopMu.Unlock()
 
 	// 取消该实例已有、尚未触发的唤醒定时器（避免重复入队叠加）。
 	s.clearTimer(runID)
 
+	// 非阻塞发送：队列满时丢弃而非死锁；持锁安全。
 	select {
 	case s.queue <- runID:
 	default:
@@ -109,6 +113,9 @@ func (s *scheduler) scheduleWakeup(runID model.RunID, deadline time.Time) {
 }
 
 // stop 关闭队列并等待所有 Worker 退出。
+//
+// close(s.queue) 在 stopMu 临界区内执行，与 enqueue 的发送互斥，
+// 避免向已关闭 channel 发送的 panic。
 func (s *scheduler) stop() {
 	s.stopMu.Lock()
 	if s.stopped {
@@ -116,9 +123,9 @@ func (s *scheduler) stop() {
 		return
 	}
 	s.stopped = true
+	close(s.queue)
 	s.stopMu.Unlock()
 
-	close(s.queue)
 	s.wg.Wait()
 
 	s.timersMu.Lock()

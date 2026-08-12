@@ -225,6 +225,64 @@ func TestAwaitTimeout(t *testing.T) {
 	}
 }
 
+// Await 的超时决策必须被持久化：一旦走超时分支，后续重放在相同历史日志下
+// 必须复现超时，迟到信号不得改变结果（设计文档 12.1 确定性约束）。
+//
+// 回归：修复前 Await 超时只返回 ErrAwaitTimeout 而不写决策日志，重放时
+// 会重新查询信箱，导致迟到信号被消费、输出由"超时"翻转为信号载荷。
+//
+// 为避免 RunSync 模式下唤醒 goroutine 的异步时序问题，本测试在超时决策
+// 落盘（实例终态）后，手动将状态重置为 Awaiting，再直接同步重放。
+func TestAwaitTimeoutDecisionPersists(t *testing.T) {
+	clk := clock.NewFakeClock()
+	e, s := newSyncEngine(t, clk)
+	e.Register("w", func(wf *WorkflowContext) error {
+		_, err := wf.Await("sig", 5*time.Second)
+		if IsAwaitTimeout(err) {
+			return wf.Return("timed-out")
+		}
+		if err != nil {
+			return err
+		}
+		return wf.Return("got-signal")
+	})
+
+	rid, _ := e.Start(context.Background(), "w", nil)
+	// Run1：无信号 -> 记录 deadline -> ErrAwaiting -> Awaiting。
+	if m, _ := e.GetResult(context.Background(), rid); m.Status != model.StatusAwaiting {
+		t.Fatalf("want Awaiting, got %s", m.Status)
+	}
+	// Run2：超过 deadline -> Fetch miss -> 超时决策落盘 -> Return("timed-out")。
+	clk.Advance(6 * time.Second)
+	m := awaitStatus(t, e, rid, time.Second)
+	if m.Status != model.StatusSucceeded || string(m.Output) != `"timed-out"` {
+		t.Fatalf("after timeout want Succeeded/timed-out, got %s/%s", m.Status, string(m.Output))
+	}
+	golden := mustReadLogs(t, s, rid)
+
+	// 模拟崩溃重启：将终态重置为 Awaiting，允许重新执行 run。
+	if err := s.UpdateStatus(context.Background(), rid, model.StatusAwaiting); err != nil {
+		t.Fatal(err)
+	}
+	// 注入一个"迟到"信号——修复前它会改变重放结果。
+	s.Push(context.Background(), rid, "sig", []byte(`"LATE"`))
+
+	// 同步重放：确定性要求结果仍是 timed-out，迟到信号被忽略。
+	e.run(context.Background(), rid)
+	m2, _ := e.GetResult(context.Background(), rid)
+	if string(m2.Output) != `"timed-out"` {
+		t.Fatalf("determinism broken: late signal changed output to %q", string(m2.Output))
+	}
+	// 日志不变：超时决策已记录，重放复现分支、不追加新条目。
+	if !logsEqual(golden, mustReadLogs(t, s, rid)) {
+		t.Fatal("replay after timeout decision should not append logs")
+	}
+	// 迟到信号未被消费（Await 在超时分支提前返回，未触达 Fetch/Ack）。
+	if !s.Has(rid, "sig") {
+		t.Fatal("late signal should remain unconsumed on timeout replay")
+	}
+}
+
 // ---- Return 原语（设计文档 6.5）----
 
 func TestReturnPrimitive(t *testing.T) {

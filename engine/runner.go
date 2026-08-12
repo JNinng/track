@@ -77,6 +77,7 @@ func (e *Engine) run(ctx context.Context, runID model.RunID) {
 		writer:       e.store,
 		mailbox:      e.store,
 		callCounters: make(map[string]int),
+		stepOrigins:  make(map[model.StepID]string),
 	}
 
 	// 标记为运行中。

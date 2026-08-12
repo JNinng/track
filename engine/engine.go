@@ -104,7 +104,19 @@ func (e *Engine) Start(ctx context.Context, name string, input any) (model.RunID
 }
 
 // Signal 向挂起的实例发送信号，触发恢复（设计文档 5.1 节）。
+//
+// 先校验实例存在且非终态，再持久化信号并唤醒，避免向不存在的实例写入
+// 孤儿信号。终态实例视为 no-op（信号无意义，直接返回 nil）。
 func (e *Engine) Signal(ctx context.Context, runID model.RunID, signal model.Signal, payload any) error {
+	// 先确认实例存在；不存在时返回错误，避免静默成功与孤儿信号。
+	m, err := e.store.GetResult(ctx, runID)
+	if err != nil {
+		return err
+	}
+	if m.Status.IsTerminal() {
+		return nil // 已终态：信号无意义，no-op。
+	}
+
 	var pb []byte
 	if payload != nil {
 		b, err := json.Marshal(payload)
@@ -116,10 +128,7 @@ func (e *Engine) Signal(ctx context.Context, runID model.RunID, signal model.Sig
 	if err := e.store.Push(ctx, runID, signal, pb); err != nil {
 		return err
 	}
-	// 仅在实例非终态时唤醒；Worker 侧也会再次校验状态。
-	if m, err := e.store.GetResult(ctx, runID); err == nil && !m.Status.IsTerminal() {
-		e.dispatch(runID)
-	}
+	e.dispatch(runID)
 	return nil
 }
 

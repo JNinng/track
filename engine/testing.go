@@ -26,11 +26,12 @@ func (e *Engine) SetTestOptions(o TestOptions) {
 	e.testOpts.noAutoRecover = o.NoAutoRecover
 }
 
-// RunOnce 同步执行一次指定实例的 run 逻辑，返回是否实际执行（已获取到锁）。
+// RunOnce 同步执行一次指定实例的 run 逻辑。
 //
 // 主要用于测试场景（如“模拟崩溃重启后的重放”）：调用方可在重置副作用计数后
 // 再次调用本方法，验证副作用未被重复触发、且日志与首次执行完全一致。
-// 也可用于运维场景下的手动重试。
+// 也可用于运维场景下的手动重试。是否实际进入业务逻辑取决于锁竞争与终态
+// 校验（详见 Engine.run）。
 func (e *Engine) RunOnce(ctx context.Context, runID model.RunID) {
 	e.run(ctx, runID)
 }

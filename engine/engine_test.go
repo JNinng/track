@@ -3,6 +3,7 @@ package engine
 import (
 	"context"
 	"errors"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -210,5 +211,96 @@ func TestVersionMismatchOnReplay(t *testing.T) {
 	}
 	if m.Err == "" {
 		t.Fatal("expected non-empty error message")
+	}
+}
+
+// 显式 StepID 在不同调用点被复用时，必须报错而非让第二个调用点静默命中
+// 第一个的历史记录（串台）。回归 ErrStepIDCollision。
+func TestExecuteRejectsCrossCallSiteStepIDReuse(t *testing.T) {
+	clk := clock.NewFakeClock()
+	e, _ := newSyncEngine(t, clk)
+	e.Register("w", func(wf *WorkflowContext) error {
+		v1, err := Execute(wf, "dup", func(ctx context.Context) (int, error) { return 1, nil })
+		if err != nil {
+			return err
+		}
+		// 不同调用点、同一显式 StepID：应返回 ErrStepIDCollision。
+		v2, err := Execute(wf, "dup", func(ctx context.Context) (int, error) { return 2, nil })
+		if err != nil {
+			return err
+		}
+		return wf.Return(v1 + v2)
+	})
+	rid, _ := e.Start(context.Background(), "w", nil)
+	m := awaitStatus(t, e, rid, time.Second)
+	if m.Status != model.StatusFailed {
+		t.Fatalf("status=%s, want Failed on StepID collision", m.Status)
+	}
+	// RunMeta.Err 是纯字符串，无法用 errors.Is 还原哨兵链；按消息内容校验。
+	if !strings.Contains(m.Err, "duplicate StepID") {
+		t.Fatalf("err=%q, want ErrStepIDCollision", m.Err)
+	}
+}
+
+// 同一显式 StepID 在同一调用点的循环中是合法的（由序号 #N 去重），不应报错。
+func TestExecuteLoopWithExplicitStepIDOK(t *testing.T) {
+	clk := clock.NewFakeClock()
+	e, s := newSyncEngine(t, clk)
+	e.Register("w", func(wf *WorkflowContext) error {
+		for i := 0; i < 3; i++ {
+			if _, err := Execute(wf, "iter", func(ctx context.Context) (int, error) { return i, nil }); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	rid, _ := e.Start(context.Background(), "w", nil)
+	m := awaitStatus(t, e, rid, time.Second)
+	if m.Status != model.StatusSucceeded {
+		t.Fatalf("status=%s err=%s", m.Status, m.Err)
+	}
+	logs := mustReadLogs(t, s, rid)
+	if len(logs) != 3 {
+		t.Fatalf("want 3 log entries, got %d", len(logs))
+	}
+	seen := map[model.StepID]struct{}{}
+	for _, l := range logs {
+		seen[l.StepID] = struct{}{}
+	}
+	if len(seen) != 3 {
+		t.Fatalf("loop StepIDs not unique: %v", seen)
+	}
+}
+
+// 对不存在的实例发信号应返回错误，且不应持久化孤儿信号。
+// 回归：修复前 GetResult 的错误被静默吞掉，Signal 对未知 runID 仍返回 nil。
+func TestSignalUnknownRunIDReturnsError(t *testing.T) {
+	clk := clock.NewFakeClock()
+	e, s := newSyncEngine(t, clk)
+	rid := model.RunID("does-not-exist")
+	err := e.Signal(context.Background(), rid, "sig", "x")
+	if !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("want ErrNotFound, got %v", err)
+	}
+	if s.Has(rid, "sig") {
+		t.Fatal("signal must not be persisted for unknown runID")
+	}
+}
+
+// 终态实例发信号应 no-op 成功，且不持久化（信号无意义）。
+func TestSignalTerminalInstanceIsNoop(t *testing.T) {
+	clk := clock.NewFakeClock()
+	e, s := newSyncEngine(t, clk)
+	e.Register("w", func(wf *WorkflowContext) error { return wf.Return("ok") })
+	rid, _ := e.Start(context.Background(), "w", nil)
+	m := awaitStatus(t, e, rid, time.Second)
+	if m.Status != model.StatusSucceeded {
+		t.Fatalf("setup failed: %s", m.Status)
+	}
+	if err := e.Signal(context.Background(), rid, "late", "x"); err != nil {
+		t.Fatalf("terminal signal should be noop, got %v", err)
+	}
+	if s.Has(rid, "late") {
+		t.Fatal("terminal signal should not persist")
 	}
 }

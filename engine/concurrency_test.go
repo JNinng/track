@@ -2,6 +2,7 @@ package engine
 
 import (
 	"context"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -139,4 +140,33 @@ func waitForCond(d time.Duration, cond func() bool) bool {
 		time.Sleep(time.Millisecond)
 	}
 	return cond()
+}
+
+// Stop 与并发 Start/唤醒定时器之间不应触发 "send on closed channel" panic。
+//
+// 回归 scheduler.enqueue 的发送与 stop 的 close 必须互斥：修复前 enqueue 在
+// 释放 stopMu 后才向 queue 发送，stop 可能在此间隙 close(queue)。
+// 反复运行以放大竞态窗口。
+func TestStopConcurrentDispatchNoPanic(t *testing.T) {
+	for i := 0; i < 200; i++ {
+		s := memory.New()
+		e := NewEngine(s, WithClock(clock.RealClock{}), WithWorkers(2))
+		e.testOpts.noAutoRecover = true
+
+		e.Register("w", func(wf *WorkflowContext) error {
+			if err := wf.Sleep(time.Millisecond); err != nil {
+				return err
+			}
+			return wf.Return("ok")
+		})
+
+		var wg sync.WaitGroup
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			e.Stop(context.Background())
+		}()
+		_, _ = e.Start(context.Background(), "w", nil)
+		wg.Wait()
+	}
 }

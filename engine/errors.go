@@ -23,6 +23,13 @@ var (
 
 	// ErrWorkflowNotFound 表示引用了未注册的工作流名称。
 	ErrWorkflowNotFound = errors.New("workflow: not registered")
+
+	// ErrStepIDCollision 表示同一显式 StepID 在不同调用点被复用。
+	//
+	// 这会导致后一个调用点命中前者的历史记录而静默跳过执行（串台），
+	// 破坏幂等性与确定性。显式 StepID 必须在每个调用点保持唯一；
+	// 若需在循环中复用，应省略显式值由引擎附加 #N 序号。
+	ErrStepIDCollision = errors.New("workflow: duplicate StepID across call sites")
 )
 
 // 以下 IsXxx 辅助函数供业务代码判断原语产生的哨兵错误（支持 errors.Is 包装）。
@@ -41,3 +48,6 @@ func IsReturn(err error) bool { return errors.Is(err, ErrReturn) }
 
 // IsVersionMismatch 报告 err 是否为版本不一致错误。
 func IsVersionMismatch(err error) bool { return errors.Is(err, ErrVersionMismatch) }
+
+// IsStepIDCollision 报告 err 是否为显式 StepID 跨调用点复用错误。
+func IsStepIDCollision(err error) bool { return errors.Is(err, ErrStepIDCollision) }
