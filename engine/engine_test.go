@@ -246,6 +246,36 @@ func TestJournalMismatchOnLeftoverEntries(t *testing.T) {
 	}
 }
 
+// 与上一个用例对称：业务函数以 `return nil` 结束（非 Return 原语）时，
+// 同样必须触发日志发散检测。回归：曾经 runner 的 nil 返回分支丢弃了
+// failOnJournalDrift 的返回值，随后 e.succeed 把 Failed 覆盖为 Succeeded，
+// 导致"代码删减步骤"的分歧被静默吞掉。
+func TestJournalMismatchOnNilReturnLeftover(t *testing.T) {
+	clk := clock.NewFakeClock()
+	e, s := newSyncEngine(t, clk)
+	e.Register("w", func(wf *WorkflowContext) error {
+		return nil // 不调用 Execute -> 孤儿条目不会被消费
+	})
+
+	rid := model.RunID("run-nil-leftover")
+	if err := s.UpdateStatus(context.Background(), rid, model.StatusRunning,
+		store.WithName("w"), store.WithVersion(defaultVersion("w"))); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Append(context.Background(), rid, model.LogEntry{Kind: model.KindExec, Payload: []byte("1")}); err != nil {
+		t.Fatal(err)
+	}
+
+	e.run(context.Background(), rid)
+	m, _ := e.GetResult(context.Background(), rid)
+	if m.Status != model.StatusFailed {
+		t.Fatalf("status=%s, want Failed on journal drift (nil-return path)", m.Status)
+	}
+	if !strings.Contains(m.Err, "journal mismatch") {
+		t.Fatalf("err=%q, want journal mismatch", m.Err)
+	}
+}
+
 // Label 是纯可读元数据：重放只按位置 + Kind 匹配。即使当前代码使用了
 // 与历史不同的 Label，重放仍命中历史条目、不重新执行、不改写已落盘的 Label。
 //

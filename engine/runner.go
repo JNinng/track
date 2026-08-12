@@ -91,8 +91,11 @@ func (e *Engine) run(ctx context.Context, runID model.RunID) {
 
 	switch {
 	case runErr == nil:
-		// 普通返回：视为成功，无显式输出。终态需校验历史无残余（见下）。
-		e.failOnJournalDrift(ctx, runID, wf)
+		// 普通返回：视为成功，无显式输出。终态需校验历史无残余：若存在未被消费的
+		// 残余条目（代码路径相较录制时缩短），以 ErrJournalMismatch 失败，不得覆盖为成功。
+		if e.failOnJournalDrift(ctx, runID, wf) {
+			return
+		}
 		e.succeed(ctx, runID, nil)
 	case errors.Is(runErr, ErrReturn):
 		out, mErr := json.Marshal(wf.returnData)

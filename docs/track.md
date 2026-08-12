@@ -72,6 +72,16 @@ UpdatedAt time.Time
 }
 ```
 
+`RunStatus` 提供两个辅助方法（已实现）：
+
+```go
+// String 返回可读名称（"Running" / "Succeeded" / ... / "Unknown"）。
+func (RunStatus) String() string
+// IsTerminal 报告是否为终态：Succeeded / Failed / Cancelled 为终态，
+// Running / Awaiting 为非终态。引擎与业务代码据此判断实例是否仍可变化。
+func (RunStatus) IsTerminal() bool
+```
+
 ### 3.4 ExecutionConfig (执行配置)
 
 用于传递给原语的策略配置。`Execute` 使用其全部字段；`Sleep`/`Await` 仅使用 `Label`
@@ -79,7 +89,7 @@ UpdatedAt time.Time
 
 ```go
 type ExecutionConfig struct {
-Label   string        // 可选人类可读标签；纯元数据，绝不参与重放匹配
+Label   string // 可选人类可读标签；纯元数据，绝不参与重放匹配
 Timeout time.Duration
 Retry   RetryPolicy
 }
@@ -114,10 +124,20 @@ type Mailbox interface {
 Push(ctx context.Context, runID RunID, signal Signal, payload []byte) error
 // 获取信号 (不删除，等待工作流确认消费)
 Fetch(ctx context.Context, runID RunID, signal Signal) ([]byte, error)
-// 确认消费信号 (在工作流成功记录 AwaitState 日志后调用)
+// 确认消费信号 (在工作流成功记录 KindAwait 日志条目后调用)
 Ack(ctx context.Context, runID RunID, signal Signal) error
 }
 ```
+
+**信号覆盖语义**：同一 `(RunID, Signal)` 键至多保留**一条**未消费信号——后到的 `Push`
+**覆盖**（last-wins）先前未消费的同键信号，而非排队累积。因此 Mailbox 是"单槽"语义，
+适用于"最近一次审批/回调生效"的场景；若业务需要多值队列，应在外部聚合后再发送单条信号。
+
+**`Ack` 的调用时机与崩溃语义**：`Ack` 必须在 `KindAwait` 消费条目**成功落盘之后**调用
+（即 commit-before-Ack 顺序）。理由是确定性的真相以日志为准：若先 `Ack`（删信号）后
+commit，崩溃在二者之间会永久丢失信号、破坏重放一致性。当前顺序下，崩溃发生在 commit
+之后、`Ack` 之前时，信号会作为"孤儿"残留（资源泄漏，但不影响确定性重放——重放时
+`KindAwait` 命中即返回，不再触达 `Fetch`/`Ack`）。这是有意以可接受的泄漏换取确定性。
 
 ### 4.3 Locker (分布式锁)
 
@@ -129,6 +149,11 @@ Acquire(ctx context.Context, runID RunID) (bool, error)
 Release(ctx context.Context, runID RunID) error
 }
 ```
+
+**租约与接管**：锁基于**租约（lease）**实现——`Acquire` 记录一个到期时刻，过期后可被其它
+Worker 直接接管（模拟分布式环境下持有者崩溃后锁自动失效）。`infra/memory` 实现默认租约
+30s，并提供 `NewLockerWithLease(d)` 自定义。测试用钩子：`IsLocked(runID)` 观测持有状态、
+`Expire(runID)` 强制过期以模拟崩溃、`SetNow(fn)` 注入可控时钟。
 
 ### 4.4 Meta (元数据)
 
@@ -148,7 +173,7 @@ ListByStatus(ctx context.Context, statuses ...RunStatus) ([]RunMeta, error)
 实现“不存在则创建、存在则更新”的 upsert 语义：
 
 ```go
-type MetaOption func(*RunMeta)
+type MetaOption func (*RunMeta)
 func WithName(string) MetaOption
 func WithVersion(string) MetaOption
 func WithInput([]byte) MetaOption
@@ -164,7 +189,7 @@ func WithErr(string) MetaOption
 
 ```go
 // WorkflowFunc 是业务工作流的统一签名。
-type WorkflowFunc func(wf *WorkflowContext) error
+type WorkflowFunc func (wf *WorkflowContext) error
 ```
 
 ```go
@@ -195,6 +220,21 @@ func (e *Engine) Stop(ctx context.Context) error
 
 ```
 
+`NewEngine` 接受 `EngineOption` 进行配置（已实现）：
+
+```go
+// WithClock 注入自定义时钟（测试用 FakeClock）。缺省为 RealClock。
+func WithClock(c Clock) EngineOption
+// WithWorkers 设置 Worker Pool 大小。缺省 8。
+func WithWorkers(n int) EngineOption
+// WithQueueSize 设置 TaskQueue 缓冲容量。缺省为 workers*4。
+func WithQueueSize(n int) EngineOption
+```
+
+> 实现注记：当前 `Stop(ctx)` 的 `ctx` 参数**未被用于关闭超时**——实现直接 `cancel()` 内部
+> context 并 `wg.Wait()` 阻塞至所有 Worker 退出。若业务 `fn` 忽略传入的 context，`Stop` 会
+> 无限阻塞。后续可考虑用 `ctx` 为 `wg.Wait` 套超时（见第 14 节待办）。
+
 触发机制：扫描任务除定时触发外，还支持自动触发与手动触发。
 自动触发：在引擎首次调用 Start 时自动执行一次 Recover 扫描（前提是工作流注册已完成）。
 手动触发：提供 Recover() API 供运维主动调用。
@@ -208,21 +248,31 @@ func (e *Engine) Stop(ctx context.Context) error
 
 ```go
 type WorkflowContext struct {
-	ctx      context.Context // 封装标准 context，用于传递取消信号等
-	runID    RunID
-	input    []byte // 启动参数（JSON），Input 原语从中反序列化
-	journal  []LogEntry // 已加载历史 + 本次 run 新提交条目（按追加序）
-	cursor   int        // 下一个待消费的 journal 位置
-	isReplay bool
-	clock    Clock
-	writer   store.Writer  // 追加日志
-	mailbox  store.Mailbox // Await 原语的信号存取
-	returnData any // Return 原语暂存结果，引擎捕获 ErrReturn 后读取
-	// 引擎内部状态（业务代码不应直接使用）：
-	sleepDeadline time.Time // Sleep 设置：ErrSleeping 时引擎据此注册唤醒定时器
-	awaitDeadline time.Time // Await 设置：ErrAwaiting 时引擎据此注册超时定时器（零值表示无超时）
+ctx      context.Context // 封装标准 context，用于传递取消信号等
+runID    RunID
+input    []byte     // 启动参数（JSON），Input 原语从中反序列化
+journal  []LogEntry // 已加载历史 + 本次 run 新提交条目（按追加序）
+cursor   int        // 下一个待消费的 journal 位置
+isReplay bool
+clock    Clock
+writer   store.Writer  // 追加日志
+mailbox  store.Mailbox // Await 原语的信号存取
+returnData any         // Return 原语暂存结果，引擎捕获 ErrReturn 后读取
+// 引擎内部状态（业务代码不应直接使用）：
+sleepDeadline time.Time // Sleep 设置：ErrSleeping 时引擎据此注册唤醒定时器
+awaitDeadline time.Time // Await 设置：ErrAwaiting 时引擎据此注册超时定时器（零值表示无超时）
 }
 ```
+
+`WorkflowContext` 对业务代码暴露的只读访问器（已实现）：
+
+```go
+func (wf *WorkflowContext) IsReplay() bool // 当前是否处于重放模式（启动时历史非空则锚定为 true）
+func (wf *WorkflowContext) RunID() RunID              // 当前运行实例 ID
+func (wf *WorkflowContext) Context() context.Context // 封装的标准 context（感知取消等）
+```
+
+业务代码可据此在重放与非重放分支间做差异化处理（如重放时跳过日志打印等可丢弃副作用）。
 
 ### 6.1 Input (输入原语)
 
@@ -316,9 +366,9 @@ func (wf *WorkflowContext) Return(result any) error
 
 - `journal []LogEntry`：已加载历史 + 本次 run 新提交条目，按追加顺序排列；`cursor` 指向下一个待消费位置。
 - `consume(want ...EntryKind)`：按位置取下一条条目，仅当其 Kind 属于 `want` 时消费并推进 cursor。
-  - **命中**：返回该条目（重放跳过实际执行）。
-  - **位置耗尽**（cursor 已到末尾）：返回空，表示该步骤尚未执行（首次运行），由原语执行后 `commit`。
-  - **Kind 不符**：返回 `ErrJournalMismatch`——代码路径与历史发散，以失败显式暴露而非静默腐化。
+    - **命中**：返回该条目（重放跳过实际执行）。
+    - **位置耗尽**（cursor 已到末尾）：返回空，表示该步骤尚未执行（首次运行），由原语执行后 `commit`。
+    - **Kind 不符**：返回 `ErrJournalMismatch`——代码路径与历史发散，以失败显式暴露而非静默腐化。
 - `commit(kind, label, payload)`：持久化并追加一条新条目，推进 cursor 至末尾。
 
 **核心收益**：
@@ -339,8 +389,8 @@ func (wf *WorkflowContext) Return(result any) error
 
 ```go
 type executionContext struct { // 引擎内部使用的扩展上下文
-	WorkflowContext // 嵌入 WorkflowContext
-	version string  // 当前代码版本
+WorkflowContext // 嵌入 WorkflowContext
+version string  // 当前代码版本
 }
 ```
 
@@ -367,6 +417,7 @@ type executionContext struct { // 引擎内部使用的扩展上下文
 > （`ErrSleeping`→`sleepDeadline`、`ErrAwaiting`→`awaitDeadline`），而非取两者中任意非零值。
 > 这避免了“Sleep 已完成后紧接 Await”场景下，过期的 `sleepDeadline` 被误用而导致 `scheduleWakeup`
 > 立即重投、形成紧忙循环。
+
 5. **状态持久化**：根据结果更新 `RunMeta` 状态。
 6. **释放锁**：`Locker.Release`。
 
@@ -375,8 +426,12 @@ type executionContext struct { // 引擎内部使用的扩展上下文
 采用 **Worker Pool** 模型，避免无限创建 Goroutine。
 
 - **TaskQueue**：带缓冲的 Channel，存放待处理的 `RunID`。作为快速通道，仅存在于内存中。
-- **Worker**：固定数量的 Goroutine，消费 TaskQueue，执行 `run` 逻辑。
+  默认容量为 `workers*4`，可通过 `WithQueueSize` 调整。
+- **Worker**：固定数量的 Goroutine，消费 TaskQueue，执行 `run` 逻辑。默认 8 个，可通过
+  `WithWorkers` 调整。
 - **唤醒机制**：`Start` 和 `Signal` 接口仅将任务 ID 推入队列，立即返回。Worker 从队列取出后异步处理。
+  队列满时 `enqueue` **静默丢弃**并记日志（任务保持原状态，待后续 `Recover` 恢复）——因此
+  在周期 Recover 落地前，应保证队列容量足够，避免突发流量下任务被丢弃后长期滞留。
 - **持久化兜底机制**：为防止进程崩溃导致内存队列丢失，扫描存储中处于 `StatusRunning` 或
   `StatusAwaiting` (且定时器已到) 的 `RunMeta`，重新推入 `TaskQueue` 恢复执行。当前实现为：引擎首次
   `Start` 时自动执行一次 `Recover` 扫描（前提是工作流注册已完成），并暴露 `Recover()` API 供运维手动
@@ -397,6 +452,25 @@ After(d time.Duration) <-chan time.Time
 
 ## 10. 错误处理与重试
 
+引擎定义以下哨兵错误（`engine/errors.go`，业务代码不直接构造，而由原语触发）：
+
+| 哨兵错误                  | 含义                             | 产生方                              |
+|-----------------------|--------------------------------|----------------------------------|
+| `ErrSleeping`         | 进入睡眠，引擎挂起并在 deadline 唤醒        | `Sleep`                          |
+| `ErrAwaiting`         | 等待外部信号，引擎挂起为 `StatusAwaiting`  | `Await`                          |
+| `ErrAwaitTimeout`     | Await 超时且信箱确无信号                | `Await`                          |
+| `ErrReturn`           | 立即终止并返回结果                      | `Return`                         |
+| `ErrVersionMismatch`  | 重放时代码版本与历史不一致，拒绝执行             | runner 版本校验                      |
+| `ErrWorkflowNotFound` | 引用了未注册的工作流名称                   | runner `lookup`                  |
+| `ErrJournalMismatch`  | 位置消费 Kind 不符，或终态有残余条目（代码与历史发散） | `consume` / `failOnJournalDrift` |
+
+业务代码可用配套的 `IsXxx(err)` 辅助函数判定（均基于 `errors.Is`，支持错误包装）：
+`IsSleeping` / `IsAwaiting` / `IsAwaitTimeout` / `IsReturn` / `IsVersionMismatch` /
+`IsJournalMismatch`。典型用法见 `examples/hello_workflow.go` 中 `IsAwaitTimeout` 的降级分支。
+
+> 注：失败状态写入 `RunMeta.Err` 时存的是错误**字符串**（`errors.Is` 无法还原哨兵链），
+> 故对持久化后的终态错误只能按消息内容匹配（测试中以 `strings.Contains` 校验）。
+
 - **业务错误**：失败步骤不写日志（见 6.2），由 `RunMeta.Err` 捕获终态错误。
 - **重试策略**：通过 `RetryPolicy` 接口定义。
 
@@ -414,7 +488,7 @@ Next(err error) (delay time.Duration, ok bool)
 
 ```go
 type Cloner interface {
-    Clone() RetryPolicy
+Clone() RetryPolicy
 }
 ```
 
@@ -531,41 +605,41 @@ type Cloner interface {
 
 ```go
 func TestWorkflowDeterminism(t *testing.T) {
-    // 1. Setup: 注入 FakeClock + 内存后端；同步执行模式便于确定性控制。
-    clk := clock.NewFakeClock()
-    store := memory.New()
-    e := engine.NewEngine(store, engine.WithClock(clk))
-    e.SetTestOptions(engine.TestOptions{RunSync: true, NoAutoRecover: true})
+// 1. Setup: 注入 FakeClock + 内存后端；同步执行模式便于确定性控制。
+clk := clock.NewFakeClock()
+store := memory.New()
+e := engine.NewEngine(store, engine.WithClock(clk))
+e.SetTestOptions(engine.TestOptions{RunSync: true, NoAutoRecover: true})
 
-    var serviceCalls int32
-    e.Register("MyWorkflow", func(wf *engine.WorkflowContext) error {
-        _, err := engine.Execute(wf, func(ctx context.Context) (int, error) {
-            atomic.AddInt32(&serviceCalls, 1)
-            return 42, nil
-        }, engine.WithLabel("step1"))
-        return err
-    })
+var serviceCalls int32
+e.Register("MyWorkflow", func (wf *engine.WorkflowContext) error {
+_, err := engine.Execute(wf, func (ctx context.Context) (int, error) {
+atomic.AddInt32(&serviceCalls, 1)
+return 42, nil
+}, engine.WithLabel("step1"))
+return err
+})
 
-    // 2. First Run (Record)
-    runID, _ := e.Start(ctx, "MyWorkflow", input)
-    // 首次执行：外部副作用被调用 1 次。
-    // serviceCalls == 1
-    goldenLogs, _ := store.Read(ctx, runID)
+// 2. First Run (Record)
+runID, _ := e.Start(ctx, "MyWorkflow", input)
+// 首次执行：外部副作用被调用 1 次。
+// serviceCalls == 1
+goldenLogs, _ := store.Read(ctx, runID)
 
-    // 3. Clear & Replay (Replay)
-    // 重置副作用计数，但不重置 Store 中的日志。
-    atomic.StoreInt32(&serviceCalls, 0)
-    // 重新加载实例（模拟崩溃重启）：重新执行 run。
-    e.RunOnce(ctx, runID)
-    // 重放执行：外部副作用必须被调用 0 次（命中历史跳过）。
-    // serviceCalls == 0
+// 3. Clear & Replay (Replay)
+// 重置副作用计数，但不重置 Store 中的日志。
+atomic.StoreInt32(&serviceCalls, 0)
+// 重新加载实例（模拟崩溃重启）：重新执行 run。
+e.RunOnce(ctx, runID)
+// 重放执行：外部副作用必须被调用 0 次（命中历史跳过）。
+// serviceCalls == 0
 
-    // 4. Verify Logs Identity
-    replayLogs, _ := store.Read(ctx, runID)
-    // 重放日志必须与 golden 完全一致（Kind/Label 顺序、Payload 内容、Err）。
-    if !logsEqual(goldenLogs, replayLogs) {
-        t.Fatal("replay logs must match golden logs")
-    }
+// 4. Verify Logs Identity
+replayLogs, _ := store.Read(ctx, runID)
+// 重放日志必须与 golden 完全一致（Kind/Label 顺序、Payload 内容、Err）。
+if !logsEqual(goldenLogs, replayLogs) {
+t.Fatal("replay logs must match golden logs")
+}
 }
 ```
 
@@ -588,6 +662,7 @@ func TestWorkflowDeterminism(t *testing.T) {
   全部通过，且 `go test -race` 无竞态。
 
 暂未实现（后续阶段）：
+
 - `infra/redis`（分布式 Locker/Mailbox）、`infra/mysql`（持久化 Reader/Writer/Meta）。
 - Recover 的**定期**后台扫描（当前仅“首次 Start 自动一次 + `Recover()` 手动触发”）。
 - `Cancel` 原语 / `StatusCancelled` 的触发路径（状态已定义，但引擎尚无 API 设置）。
@@ -614,6 +689,15 @@ func TestWorkflowDeterminism(t *testing.T) {
    （`ErrSleeping`→`sleepDeadline`、`ErrAwaiting`→`awaitDeadline`）。切勿取“任一非零字段”——当 Sleep 已
    完成（`remaining<=0` 返回 nil）但其 `sleepDeadline` 仍保留为过期值时，若随后 Await 挂起，误用过期值会令
    `scheduleWakeup` 立即重投，触发紧忙循环（已由 `TestSleepCompletedThenAwaitNoBusyLoop` 守护）。
+9. **Await 的 commit-before-Ack 顺序**：`Await` 成功消费信号时，先 `commit(KindAwait)` 落盘决策、
+   再 `Mailbox.Ack` 删除信号。日志是确定性的真相：若先 Ack 后 commit，崩溃在二者之间会永久丢失信号、
+   破坏重放一致性。当前顺序下，崩溃发生在 commit 之后、Ack 之前会产生孤儿信号（资源泄漏但不影响确定性
+   ——重放时 `KindAwait` 命中即返回，不再触达 Fetch/Ack）。
+10. **终态发散守卫覆盖两条返回路径**：业务函数终态返回 `nil` 或 `ErrReturn` 时，runner 均调用
+    `failOnJournalDrift` 校验 `cursor == len(journal)`；若存在未被消费的残余条目（代码路径相较录制时
+    缩短），以 `ErrJournalMismatch` 失败，**不得**继续 `succeed` 覆盖。两条路径分别由
+    `TestJournalMismatchOnNilReturnLeftover` 与 `TestJournalMismatchOnLeftoverEntries` 守护（回归：
+    nil 路径曾因丢弃 `failOnJournalDrift` 返回值而把 Failed 错误覆盖为 Succeeded）。
 
 ### 13.3 运行方式
 
@@ -622,3 +706,21 @@ go test ./... -race        # 运行全部测试（含竞态检测）
 go run ./examples          # 运行示例工作流
 go vet ./...               # 静态检查
 ```
+
+## 14. 已知限制与后续待办
+
+本节记录经代码审查确认的、不影响核心确定性但应在后续阶段处理的项：
+
+1. **`Stop(ctx)` 未用 ctx 控制关闭超时**：当前实现 `cancel()` + `wg.Wait()` 无条件阻塞，
+   若业务 `fn` 忽略传入 context，`Stop` 会无限等待。后续应以 `ctx` 给 `wg.Wait` 套超时
+   （select `done`/`ctx.Done()`）。
+2. **`Await` 中 `Mailbox.Fetch` 被调用两次**：deadline 已到且信箱有信号时，超时判定 Fetch
+   与取值 Fetch 连续执行两次。内存后端无影响，但对计费/远程后端是双倍读，可合并为单次。
+3. **`Mailbox.Ack` 失败导致终态卡死**：`commit(KindAwait)` 成功后若 `Ack` 返回错误，当前会把
+   实例标记 `Failed`（终态），即使日志已持有可成功重放的数据。建议 Ack 失败时仅记日志、不
+   判定工作流失败（日志已是真相）。
+4. **队列满静默丢弃 + 缺周期 Recover**：`enqueue` 在队列满时丢弃任务（保持原状态），而周期
+   后台 `Recover` 尚未实现（见 13.1）。突发流量下被丢弃的任务需运维手动 `Recover` 恢复。
+5. **未使用的测试开关死码**：`options.go` 中未导出的 `testOption` 类型及 `withNoAutoRecover` /
+   `withRunSync` 无调用方（包内测试直接设置 `e.testOpts`），与已导出的 `TestOptions` /
+   `SetTestOptions` 职责重复，应删除。

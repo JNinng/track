@@ -36,7 +36,7 @@ type Mailbox interface {
 	// Fetch 获取信号（不删除，等待工作流确认消费）。
 	// 不存在时返回 ErrNotFound。
 	Fetch(ctx context.Context, runID model.RunID, signal model.Signal) ([]byte, error)
-	// Ack 确认消费信号（在工作流成功记录 AwaitState 日志后调用）。
+	// Ack 确认消费信号（在工作流成功记录 KindAwait 日志条目后调用）。
 	Ack(ctx context.Context, runID model.RunID, signal model.Signal) error
 }
 
