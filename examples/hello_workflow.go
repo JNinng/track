@@ -18,6 +18,7 @@ import (
 	"github.com/jninng/track/engine"
 	"github.com/jninng/track/infra/memory"
 	"github.com/jninng/track/model"
+	"github.com/jninng/track/store"
 )
 
 // HelloInput 是 HelloWorkflow 的启动参数。
@@ -62,6 +63,22 @@ func main() {
 	if result.Err != "" {
 		fmt.Printf("error:  %s\n", result.Err)
 	}
+
+	// 5. 读取该实例的全部重放日志并打印。
+	logs, err := getReplayLogs(context.Background(), store, runID)
+	if err != nil {
+		log.Fatal(err)
+	}
+	fmt.Println("replay logs:")
+	for i, l := range logs {
+		fmt.Printf("  %02d. step=%s payload=%s\n", i+1, l.StepID, string(l.Payload))
+	}
+}
+
+// getReplayLogs 返回指定运行实例的全部重放日志（按追加顺序）。
+// store.Reader 是日志读取的最小接口，任何满足它的后端（如 memory.Store）均可传入。
+func getReplayLogs(ctx context.Context, r store.Reader, runID model.RunID) ([]model.LogEntry, error) {
+	return r.Read(ctx, runID)
 }
 
 // HelloWorkflow 是业务工作流。它通过注入的 *engine.WorkflowContext 调用各原语。
