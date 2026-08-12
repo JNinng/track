@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/jninng/track/clock"
+	"github.com/jninng/track/infra/memory"
 	"github.com/jninng/track/model"
 )
 
@@ -99,6 +100,42 @@ func TestSleepDeadlinePersistsAcrossRuns(t *testing.T) {
 	replay := mustReadLogs(t, s, rid)
 	if !logsEqual(golden, replay) {
 		t.Fatal("replay after sleep should not append logs")
+	}
+}
+
+// Sleep 完成后紧接 Await（无信号）不得触发紧忙循环。
+//
+// 回归：曾经 nextWakeup 优先返回 sleepDeadline，即使 Sleep 已完成（remaining<=0
+// 返回 nil）该字段仍为过期值。引擎据此调用 scheduleWakeup，后者见 remaining<=0
+// 立即重投，导致工作流体在 200ms 内被进入十余万次。修复后唤醒时刻按返回的
+// 哨兵错误选取（ErrSleeping -> sleepDeadline，ErrAwaiting -> awaitDeadline）。
+func TestSleepCompletedThenAwaitNoBusyLoop(t *testing.T) {
+	s := memory.New()
+	e := NewEngine(s, WithClock(clock.RealClock{}), WithWorkers(1))
+	e.testOpts.noAutoRecover = true
+	defer e.Stop(context.Background())
+
+	var entries int32
+	e.Register("w", func(wf *WorkflowContext) error {
+		atomic.AddInt32(&entries, 1)
+		if err := wf.Sleep(time.Millisecond); err != nil {
+			return err
+		}
+		_, err := wf.Await("sig", time.Hour)
+		return err
+	})
+
+	rid, _ := e.Start(context.Background(), "w", nil)
+	// 给引擎充足时间暴露潜在的紧忙循环。
+	time.Sleep(200 * time.Millisecond)
+
+	got := atomic.LoadInt32(&entries)
+	m, _ := e.GetResult(context.Background(), rid)
+	if got > 50 {
+		t.Fatalf("busy loop: workflow body entered %d times in 200ms, want <=50 (status=%s)", got, m.Status)
+	}
+	if m.Status != model.StatusAwaiting {
+		t.Fatalf("status=%s, want Awaiting (suspended on Await)", m.Status)
 	}
 }
 

@@ -168,7 +168,7 @@ clock    Clock
 // ...
 }
 // Register 注册一个工作流。
-// name: 注册的工作流名称（须全局唯一）
+// name: 注册的工作流名称（建议全局唯一；同名重复注册将覆盖既有条目）
 // fn:   工作流函数
 // opts: 可选 WithVersion(v) 指定代码版本号；缺省时基于 name 计算稳定哈希。
 //       当步骤语义发生破坏性变更时，应显式提升版本以防破坏重放确定性。
@@ -185,6 +185,7 @@ func (e *Engine) Signal(ctx context.Context, runID RunID, signal Signal, payload
 func (e *Engine) GetResult(ctx context.Context, runID RunID) (*RunMeta, error)
 // Stop 优雅关闭引擎，等待 Worker 停止
 func (e *Engine) Stop(ctx context.Context) error
+
 ```
 
 触发机制：扫描任务除定时触发外，还支持自动触发与手动触发。
@@ -200,19 +201,20 @@ func (e *Engine) Stop(ctx context.Context) error
 
 ```go
 type WorkflowContext struct {
-ctx        context.Context // 封装标准 context，用于传递取消信号等
-runID      RunID
-input      []byte // 启动参数（JSON），Input 原语从中反序列化
-history    map[StepID]*LogEntry // 内存索引，加速查找
-isReplay   bool
-clock      Clock
-store      store.Writer
-mailbox    store.Mailbox
-returnData any // 用于 Return 原语暂存结果
-// 引擎内部状态（业务代码不应直接使用）：
-callCounters  map[string]int // 每个调用点的执行序号，用于循环中生成唯一 StepID
-sleepDeadline time.Time      // Sleep 设置，引擎据此注册唤醒定时器
-awaitDeadline time.Time      // Await 设置，引擎据此注册超时唤醒定时器
+	ctx      context.Context // 封装标准 context，用于传递取消信号等
+	runID    RunID
+	input    []byte // 启动参数（JSON），Input 原语从中反序列化
+	history  map[StepID]*LogEntry // 内存索引，加速查找
+	isReplay bool
+	clock    Clock
+	writer   store.Writer  // 追加日志
+	mailbox  store.Mailbox // Await 原语的信号存取
+	returnData any // Return 原语暂存结果，引擎捕获 ErrReturn 后读取
+	// 引擎内部状态（业务代码不应直接使用）：
+	callCounters  map[string]int    // 每个调用点的执行序号，用于循环中生成唯一 StepID
+	stepOrigins   map[StepID]string // 最终 StepID 首次出现的调用点，用于检测显式 StepID 跨调用点复用
+	sleepDeadline time.Time         // Sleep 设置：ErrSleeping 时引擎据此注册唤醒定时器
+	awaitDeadline time.Time         // Await 设置：ErrAwaiting 时引擎据此注册超时定时器（零值表示无超时）
 }
 ```
 
@@ -231,8 +233,7 @@ func Input[T any](wf *WorkflowContext) (T, error)
 核心幂等执行单元。
 
 ```go
-// Execute 执行幂等步骤，通过泛型函数实现
-// T 为输入参数类型（通常未使用，可省略），R 为返回类型
+// Execute 执行幂等步骤，通过泛型函数实现，R 为返回类型
 func Execute[R any](wf *WorkflowContext, stepID StepID, fn func (ctx context.Context) (R, error), opts ...Option) (R, error)
 ```
 
@@ -249,6 +250,9 @@ func Execute[R any](wf *WorkflowContext, stepID StepID, fn func (ctx context.Con
    - 若传入显式 `stepID`，以其作为 Base；否则以调用点 `file:line` 作为 Base。
    - 序号 > 1 时附加 `#N` 后缀（如 `step#2`）。
    - 计数器在每个 `WorkflowContext`（即每次 run）内独立，重放时同一代码路径产生相同序列。
+7. **跨调用点冲突检测**：若两个不同调用点产生相同的最终 StepID（典型场景：多处传入同一显式
+   `stepID`），Execute 返回 `ErrStepIDCollision` 而非让后者静默命中前者的历史记录（串台）。同一调用点
+   在循环中复用同一显式 `stepID` 是合法的——由 `#N` 序号去重。
 
 ### 6.3 Sleep (睡眠原语)
 
@@ -282,16 +286,17 @@ func (wf *WorkflowContext) Await(signal Signal, timeout time.Duration) ([]byte, 
 
 **逻辑：**
 
-1. 优先检查日志中是否已有消费该 Signal 的成功记录，若有则直接返回历史结果。
-2. 检查 `Mailbox` 是否已有信号 (Fetch)。
-3. 若有：
-    - 记录 `AwaitState` 日志 (表示已成功消费)。
-    - 调用 `Mailbox.Ack` 删除信号。
-    - 返回数据。
-4. 若无：
-    - 记录 `AwaitState` 日志。
-    - 返回 `ErrAwaiting` 错误。
-    - 引擎捕获 `ErrAwaiting` 后，更新状态为 `StatusAwaiting` 并释放 Goroutine。
+1. 查询历史中该调用点的记录：若 `Err == "await_timeout"`（超时决策已持久化），直接复现超时分支返回
+   `ErrAwaitTimeout`，**不再查询信箱**；若无错误（成功消费记录），直接返回历史 payload。这一步是确定性
+   的关键：重放结果不依赖信箱当前态，迟到的信号无法改变已定型的结果。
+2. 若设置了 `timeout > 0`，用独立的 `:deadline` StepID 记录/恢复超时截止时刻（首次计算
+   `clock.Now().Add(timeout)` 并持久化，重放时恢复同一值）。
+3. 若 deadline 已到且信箱确无信号：持久化超时决策（写 `Err == "await_timeout"` 的记录）后返回
+   `ErrAwaitTimeout`。业务代码可据此降级（如返回默认值）。
+4. 检查 `Mailbox` 是否已有信号（Fetch）。
+5. 若有：记录消费日志（成功记录）、调用 `Mailbox.Ack` 删除信号、返回数据。
+6. 若无：设置 `awaitDeadline`，返回 `ErrAwaiting`。引擎捕获后更新状态为 `StatusAwaiting` 并释放
+   Goroutine，等待外部 `Signal` 或超时定时器唤醒。
 
 ### 6.5 Return (返回原语)
 
@@ -313,10 +318,13 @@ func (wf *WorkflowContext) Return(result any) error
 
 ```go
 type executionContext struct { // 引擎内部使用的扩展上下文
-WorkflowContext // 嵌入 WorkflowContext
-version string  // 当前代码版本
+	WorkflowContext // 嵌入 WorkflowContext
+	version string  // 当前代码版本
 }
 ```
+
+> 注：当前实现未引入独立的 `executionContext` 结构。版本号保存在注册表条目 `registeredWorkflow.version`
+> 中；运行循环（见 7.2）在加载历史后，将其与 `RunMeta.Version` 比对。`WorkflowContext` 本身不持有版本号。
 
 ### 7.2 运行循环
 
@@ -328,9 +336,15 @@ version string  // 当前代码版本
 3. **构建上下文**：创建 `executionContext`，注入依赖。
 4. **执行业务**：调用注册的 WorkflowFunc。
     - 捕获 `ErrReturn` -> 标记成功，提取 `returnData`。
-    - 捕获 `ErrAwaiting` -> 标记为 `StatusAwaiting`，等待外部信号唤醒。
-    - 捕获 `ErrSleeping` -> 标记为 `StatusAwaiting`，并注册内部定时器在 `deadline` 到达时自动唤醒。
+    - 捕获 `ErrSleeping` -> 标记为 `StatusAwaiting`，以 `sleepDeadline` 注册唤醒定时器。
+    - 捕获 `ErrAwaiting` -> 标记为 `StatusAwaiting`，以 `awaitDeadline` 注册超时定时器（零值表示不注册
+      定时器，仅等待外部 `Signal`）。
     - 捕获其他错误 -> 标记失败。
+
+> **唤醒时刻的选取**：调度唤醒时，依据**返回的哨兵错误**选取对应的截止时刻
+> （`ErrSleeping`→`sleepDeadline`、`ErrAwaiting`→`awaitDeadline`），而非取两者中任意非零值。
+> 这避免了“Sleep 已完成后紧接 Await”场景下，过期的 `sleepDeadline` 被误用而导致 `scheduleWakeup`
+> 立即重投、形成紧忙循环。
 5. **状态持久化**：根据结果更新 `RunMeta` 状态。
 6. **释放锁**：`Locker.Release`。
 
@@ -341,8 +355,10 @@ version string  // 当前代码版本
 - **TaskQueue**：带缓冲的 Channel，存放待处理的 `RunID`。作为快速通道，仅存在于内存中。
 - **Worker**：固定数量的 Goroutine，消费 TaskQueue，执行 `run` 逻辑。
 - **唤醒机制**：`Start` 和 `Signal` 接口仅将任务 ID 推入队列，立即返回。Worker 从队列取出后异步处理。
-- **持久化兜底机制**：为防止进程崩溃导致内存队列丢失，Worker Pool 启动时或定期扫描存储中处于 `StatusRunning` 或
-  `StatusAwaiting` (且定时器已到) 的 `RunMeta`，重新推入 `TaskQueue` 恢复执行。
+- **持久化兜底机制**：为防止进程崩溃导致内存队列丢失，扫描存储中处于 `StatusRunning` 或
+  `StatusAwaiting` (且定时器已到) 的 `RunMeta`，重新推入 `TaskQueue` 恢复执行。当前实现为：引擎首次
+  `Start` 时自动执行一次 `Recover` 扫描（前提是工作流注册已完成），并暴露 `Recover()` API 供运维手动
+  触发；**定期的后台扫描暂未实现**（见 13.1）。
 
 ## 9. 时间接缝
 
@@ -548,7 +564,10 @@ func TestWorkflowDeterminism(t *testing.T) {
 - 第 12 节定义的确定性测试套件（Record/Replay、时间穿越、幂等性、锁互斥与租约接管、版本不一致），
   全部通过，且 `go test -race` 无竞态。
 
-暂未实现（后续阶段）：`infra/redis`（分布式 Locker/Mailbox）、`infra/mysql`（持久化 Reader/Writer/Meta）。
+暂未实现（后续阶段）：
+- `infra/redis`（分布式 Locker/Mailbox）、`infra/mysql`（持久化 Reader/Writer/Meta）。
+- Recover 的**定期**后台扫描（当前仅“首次 Start 自动一次 + `Recover()` 手动触发”）。
+- `Cancel` 原语 / `StatusCancelled` 的触发路径（状态已定义，但引擎尚无 API 设置）。
 
 ### 13.2 关键实现约定
 
@@ -556,7 +575,10 @@ func TestWorkflowDeterminism(t *testing.T) {
    记录中恒为空，保留以供扩展与 Await 等原语复用。
 2. **重试状态隔离**：状态化 `RetryPolicy` 实现 `Cloner`，引擎在每次 `Execute` 调用前克隆独立副本。
 3. **StepID 生成**：调用点（`file:line`）作为计数键；显式 `stepID` 优先作为 Base；序号 > 1 时附加 `#N`。
-   计数器按每次 run 独立重建，使重放复现完全一致的 ID 序列。
+   计数器按每次 run 独立重建，使重放复现完全一致的 ID 序列。调用点仅取文件名（不含目录路径），故跨机器
+   一致；但任何改变行号的编辑（即便仅增删注释）都会偏移隐式 StepID、破坏与既有日志的重放匹配——此类
+   重构应显式提供 `stepID`，或提升工作流版本。不同调用点复用同一显式 `stepID` 会触发
+   `ErrStepIDCollision`（见 6.2）。
 4. **Sleep / Await 唤醒的确定性**：唤醒定时器通道在 `scheduleWakeup` 的**同步阶段**注册（而非 goroutine 内），
    确保 FakeClock 下 deadline 锚定在当前时刻，避免与 `Advance` 发生注册竞态。
 5. **版本号默认值**：`Register` 未传 `WithVersion` 时，基于工作流名称计算稳定哈希；该默认值**无法感知代码
@@ -564,6 +586,10 @@ func TestWorkflowDeterminism(t *testing.T) {
 6. **Await 的超时**：通过独立的 `:deadline` StepID 持久化超时截止时刻，确保重放时确定性一致；超时未收到
    信号时返回 `ErrAwaitTimeout`，业务代码可据此决定是否降级（如返回默认值）。
 7. **测试钩子**：`TestOptions{RunSync, NoAutoRecover}` 与 `RunOnce` 用于确定性测试；生产代码保持默认异步模式。
+8. **唤醒时刻按哨兵错误选取**：调度唤醒时以返回的哨兵错误决定使用哪个截止时刻
+   （`ErrSleeping`→`sleepDeadline`、`ErrAwaiting`→`awaitDeadline`）。切勿取“任一非零字段”——当 Sleep 已
+   完成（`remaining<=0` 返回 nil）但其 `sleepDeadline` 仍保留为过期值时，若随后 Await 挂起，误用过期值会令
+   `scheduleWakeup` 立即重投，触发紧忙循环（已由 `TestSleepCompletedThenAwaitNoBusyLoop` 守护）。
 
 ### 13.3 运行方式
 

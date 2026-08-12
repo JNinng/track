@@ -230,15 +230,6 @@ func executeWithPolicy[R any](wf *WorkflowContext, cfg ExecutionConfig, fn func(
 	}
 }
 
-// nextWakeup 返回当前挂起语义下最早应唤醒的时刻（sleep 或 await），
-// 供引擎注册定时器。零值表示无需定时唤醒（仅等待信号）。
-func (wf *WorkflowContext) nextWakeup() time.Time {
-	if !wf.sleepDeadline.IsZero() {
-		return wf.sleepDeadline
-	}
-	return wf.awaitDeadline
-}
-
 // Sleep 支持长时等待，不占用线程（设计文档 6.3 节）。
 //
 // 逻辑：

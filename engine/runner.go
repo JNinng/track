@@ -100,13 +100,20 @@ func (e *Engine) run(ctx context.Context, runID model.RunID) {
 			return
 		}
 		e.succeed(ctx, runID, out)
-	case errors.Is(runErr, ErrAwaiting), errors.Is(runErr, ErrSleeping):
-		// 挂起：等待信号或定时器唤醒。
+	case errors.Is(runErr, ErrSleeping):
+		// 挂起：等待睡眠 deadline 到达后唤醒。
 		if err := e.store.UpdateStatus(ctx, runID, model.StatusAwaiting); err != nil {
 			log.Printf("engine: mark awaiting for %s failed: %v", runID, err)
 			return
 		}
-		e.scheduleWakeup(runID, wf.nextWakeup())
+		e.scheduleWakeup(runID, wf.sleepDeadline)
+	case errors.Is(runErr, ErrAwaiting):
+		// 挂起：等待外部信号或 await 超时唤醒。
+		if err := e.store.UpdateStatus(ctx, runID, model.StatusAwaiting); err != nil {
+			log.Printf("engine: mark awaiting for %s failed: %v", runID, err)
+			return
+		}
+		e.scheduleWakeup(runID, wf.awaitDeadline)
 	default:
 		e.fail(ctx, runID, runErr.Error())
 	}
