@@ -27,21 +27,21 @@ func TestWorkflowDeterminism(t *testing.T) {
 			return err
 		}
 
-		total, err := Execute(wf, "fetch", func(ctx context.Context) (int, error) {
+		total, err := Execute(wf, func(ctx context.Context) (int, error) {
 			atomic.AddInt32(&serviceCalls, 1)
 			sum := 0
 			for _, v := range in {
 				sum += v
 			}
 			return sum, nil
-		})
+		}, WithLabel("fetch"))
 		if err != nil {
 			return err
 		}
 
-		// 循环中的幂等步骤：每个迭代调用同一调用点，StepID 自动附加序号。
+		// 循环中的幂等步骤：位置重放下每个迭代各占一条 KindExec 条目。
 		for i := 0; i < len(in); i++ {
-			_, err := Execute(wf, "", func(ctx context.Context) (int, error) {
+			_, err := Execute(wf, func(ctx context.Context) (int, error) {
 				atomic.AddInt32(&serviceCalls, 1)
 				return in[i] * in[i], nil
 			})

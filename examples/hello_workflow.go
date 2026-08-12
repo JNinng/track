@@ -71,7 +71,11 @@ func main() {
 	}
 	fmt.Println("replay logs:")
 	for i, l := range logs {
-		fmt.Printf("  %02d. step=%s payload=%s\n", i+1, l.StepID, string(l.Payload))
+		label := l.Label
+		if label == "" {
+			label = "-"
+		}
+		fmt.Printf("  %02d. kind=%s label=%s payload=%s\n", i+1, l.Kind, label, string(l.Payload))
 	}
 }
 
@@ -92,23 +96,24 @@ func HelloWorkflow(wf *engine.WorkflowContext) error {
 		return err
 	}
 
-	// 6.2 Execute：幂等执行。崩溃重放时若日志中已有该 StepID，则跳过实际执行。
-	greeting, err := engine.Execute(wf, "greet", func(ctx context.Context) (string, error) {
+	// 6.2 Execute：幂等执行。崩溃重放时若日志中已有该位置的 KindExec 记录，则跳过实际执行。
+	// WithLabel 附加人类可读标签（仅供调试，不影响重放匹配）。
+	greeting, err := engine.Execute(wf, func(ctx context.Context) (string, error) {
 		// 这里可以是任意副作用：HTTP 调用、DB 写入等。
 		return "Hello, " + in.Name, nil
-	})
+	}, engine.WithLabel("greet"))
 	if err != nil {
 		return err
 	}
 
 	// 6.3 Sleep：长时等待，不占用 Worker 线程。
 	// 引擎捕获 ErrSleeping 并在 deadline 到达时自动唤醒，业务代码只需透传错误。
-	if err := wf.Sleep(50 * time.Millisecond); err != nil {
+	if err := wf.Sleep(50*time.Millisecond, engine.WithLabel("nap")); err != nil {
 		return err
 	}
 
 	// 6.4 Await：跨重启等待外部信号。
-	payload, err := wf.Await(model.Signal("approved"), 5*time.Second)
+	payload, err := wf.Await(model.Signal("approved"), 5*time.Second, engine.WithLabel("approve"))
 	if err != nil {
 		if engine.IsAwaitTimeout(err) {
 			return wf.Return(greeting + " (unapproved)")

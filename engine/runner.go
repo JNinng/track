@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log"
 	"time"
 
@@ -58,26 +59,25 @@ func (e *Engine) run(ctx context.Context, runID model.RunID) {
 		return
 	}
 
-	// 4. 加载历史日志。
+	// 4. 加载历史日志（按追加顺序）。
 	logs, err := e.store.Read(ctx, runID)
 	if err != nil {
 		log.Printf("engine: read logs for %s failed: %v", runID, err)
 		return
 	}
-	history := buildHistory(logs)
 
-	// 5. 构建上下文。
+	// 5. 构建上下文：journal 为日志的工作副本（消费 + 新提交），
+	//    cursor 指向下一个待消费位置。isReplay 在 run 开始时一次性锚定，
+	//    不随 journal 增长而翻转。
 	wf := &WorkflowContext{
-		ctx:          ctx,
-		runID:        runID,
-		input:        meta.Input,
-		history:      history,
-		isReplay:     len(logs) > 0,
-		clock:        e.clock,
-		writer:       e.store,
-		mailbox:      e.store,
-		callCounters: make(map[string]int),
-		stepOrigins:  make(map[model.StepID]string),
+		ctx:      ctx,
+		runID:    runID,
+		input:    meta.Input,
+		journal:  logs,
+		isReplay: len(logs) > 0,
+		clock:    e.clock,
+		writer:   e.store,
+		mailbox:  e.store,
 	}
 
 	// 标记为运行中。
@@ -91,12 +91,16 @@ func (e *Engine) run(ctx context.Context, runID model.RunID) {
 
 	switch {
 	case runErr == nil:
-		// 普通返回：视为成功，无显式输出。
+		// 普通返回：视为成功，无显式输出。终态需校验历史无残余（见下）。
+		e.failOnJournalDrift(ctx, runID, wf)
 		e.succeed(ctx, runID, nil)
 	case errors.Is(runErr, ErrReturn):
 		out, mErr := json.Marshal(wf.returnData)
 		if mErr != nil {
 			e.fail(ctx, runID, mErr.Error())
+			return
+		}
+		if e.failOnJournalDrift(ctx, runID, wf) {
 			return
 		}
 		e.succeed(ctx, runID, out)
@@ -115,8 +119,28 @@ func (e *Engine) run(ctx context.Context, runID model.RunID) {
 		}
 		e.scheduleWakeup(runID, wf.awaitDeadline)
 	default:
+		// 业务返回普通 error 或原语返回 ErrJournalMismatch 等：标记失败。
+		// 若是 divergence（如 ErrJournalMismatch），其本身即错误信息。
 		e.fail(ctx, runID, runErr.Error())
 	}
+}
+
+// failOnJournalDrift 检测终态时历史是否有未被消费的残余条目。
+//
+// 业务函数正常完成（nil / ErrReturn）时，本次 run 应已按相同顺序重新走过
+// 所有已记录步骤，cursor 必等于 journal 长度。若 cursor < len(journal)，
+// 说明当前代码路径相较录制时缩短（如删除了某个原语调用），继续重放会与
+// 历史不一致——以 ErrJournalMismatch 显式失败，而非静默成功。返回 true 表示已标记失败。
+//
+// 挂起（ErrSleeping/ErrAwaiting）路径不调用本检查：挂起时工作流尚未走完，
+// 存在尚未消费的未来条目是正常的。
+func (e *Engine) failOnJournalDrift(ctx context.Context, runID model.RunID, wf *WorkflowContext) bool {
+	if wf.cursor == len(wf.journal) {
+		return false
+	}
+	e.fail(ctx, runID, fmt.Errorf("%w: %d unconsumed entries after terminal return (cursor=%d len=%d)",
+		ErrJournalMismatch, len(wf.journal)-wf.cursor, wf.cursor, len(wf.journal)).Error())
+	return true
 }
 
 // scheduleWakeup 注册（或立即触发）实例的唤醒。
@@ -140,17 +164,6 @@ func (e *Engine) fail(ctx context.Context, runID model.RunID, msg string) {
 	if err := e.store.UpdateStatus(ctx, runID, model.StatusFailed, store.WithErr(msg)); err != nil {
 		log.Printf("engine: mark failed for %s failed: %v", runID, err)
 	}
-}
-
-// buildHistory 将日志切片构建为按 StepID 索引的 map。
-// 相同 StepID 出现多次时，后写入者覆盖（保留最新）。
-func buildHistory(logs []model.LogEntry) map[model.StepID]*model.LogEntry {
-	m := make(map[model.StepID]*model.LogEntry, len(logs))
-	for i := range logs {
-		e := logs[i]
-		m[e.StepID] = &e
-	}
-	return m
 }
 
 // lookup 按名称查找已注册的工作流。

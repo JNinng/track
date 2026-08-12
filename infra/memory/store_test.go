@@ -16,8 +16,8 @@ func ctxn() context.Context { return context.Background() }
 func TestStoreLogsAppendAndRead(t *testing.T) {
 	s := New()
 	rid := model.RunID("r1")
-	e1 := model.LogEntry{StepID: "s1", Payload: []byte(`1`)}
-	e2 := model.LogEntry{StepID: "s2", Payload: []byte(`2`)}
+	e1 := model.LogEntry{Kind: model.KindExec, Label: "s1", Payload: []byte(`1`)}
+	e2 := model.LogEntry{Kind: model.KindSleep, Label: "s2", Payload: []byte(`2`)}
 	if err := s.Append(ctxn(), rid, e1); err != nil {
 		t.Fatal(err)
 	}
@@ -28,7 +28,8 @@ func TestStoreLogsAppendAndRead(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(got) != 2 || got[0].StepID != "s1" || got[1].StepID != "s2" {
+	if len(got) != 2 || got[0].Kind != model.KindExec || got[0].Label != "s1" ||
+		got[1].Kind != model.KindSleep || got[1].Label != "s2" {
 		t.Fatalf("unexpected logs: %+v", got)
 	}
 	// 副本隔离：修改返回值不影响内部状态。
@@ -173,7 +174,7 @@ func TestStoreConcurrentAccess(t *testing.T) {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			s.Append(ctxn(), rid, model.LogEntry{StepID: model.StepID("a"), Payload: []byte{byte(i)}})
+			s.Append(ctxn(), rid, model.LogEntry{Kind: model.KindExec, Label: "a", Payload: []byte{byte(i)}})
 			s.Read(ctxn(), rid)
 		}(i)
 	}

@@ -27,16 +27,20 @@ func mustReadLogs(t *testing.T, s *memory.Store, runID model.RunID) []model.LogE
 	return logs
 }
 
-// logsEqual 比较两份日志的 StepID 顺序与 Payload 内容是否完全一致。
+// logsEqual 比较两份日志的 Kind/Label 顺序与 Payload 内容是否完全一致。
 //
 // 这是确定性重放的核心断言（设计文档 12.1）：给定相同输入与历史，
-// 重放生成的日志必须与首次执行完全匹配。
+// 重放生成的日志必须与首次执行完全匹配。运行时 consume 只按位置 + Kind 匹配，
+// 此处额外比较 Label 仅为加严测试（同码黄金样本下必然一致）。
 func logsEqual(a, b []model.LogEntry) bool {
 	if len(a) != len(b) {
 		return false
 	}
 	for i := range a {
-		if a[i].StepID != b[i].StepID {
+		if a[i].Kind != b[i].Kind {
+			return false
+		}
+		if a[i].Label != b[i].Label {
 			return false
 		}
 		if string(a[i].Payload) != string(b[i].Payload) {

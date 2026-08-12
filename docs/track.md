@@ -12,8 +12,12 @@
 
 引擎采用**日志驱动**架构。工作流的每一次关键动作（如执行步骤、睡眠、等待信号）都会生成一条不可变的日志记录。
 
-- **StepID**：步骤的唯一标识符。在代码中通常以函数名或行号位置命名。引擎通过 StepID 实现幂等性：若日志中已存在该 StepID
-  的成功记录，则跳过执行。
+- **位置日志（Positional Journal）**：日志按追加顺序构成一个有序序列，重放时每个原语**按位置**消费下一条历史记录，
+  身份由“位置 + Kind”决定，而非任何字符串键。这是幂等性的基础：若该位置已有匹配 Kind 的记录，则跳过实际执行。
+- **EntryKind**：日志条目的功能类别（exec/sleep/await 等）。重放时引擎据此校验位置上的条目是否与当前原语预期一致，
+  不符即判定为代码与历史发散（`ErrJournalMismatch`）。
+- **Label**：可选的人类可读标签，写入日志条目仅供调试。**绝不参与重放匹配**——修改 Label 是 cosmetic 变更，
+  不会破坏既有日志的重放。
 - **Signal**：外部事件标识符。用于 `Await` 原语中关联外部系统发送的特定事件。
 - **LogEntry**：持久化的日志实体。
 - **RunMeta**：运行实例的顶层元数据，用于状态监控和快速查询。
@@ -25,9 +29,8 @@
 为了消除 primitive obsession（原始类型滥用），提升编译期类型安全，定义以下命名类型：
 
 ```go
-// StepID 是工作流步骤的唯一标识符。
-// 通常由函数名 + 行号派生，引擎据此实现幂等与重放。
-type StepID string
+// EntryKind 标识日志条目的功能类别，用于位置重放的匹配与发散检测。
+type EntryKind string
 // Signal 是 Await 原语外部事件的标识符。
 type Signal string
 // RunID 是工作流运行实例的唯一标识符。
@@ -38,9 +41,10 @@ type RunID string
 
 ```go
 type LogEntry struct {
-StepID  StepID // 步骤唯一标识
-Payload []byte // 序列化的执行结果 (JSON)
-Err     string    // 错误信息，空表示成功
+Kind    EntryKind // 功能类别（exec/sleep/await 等），重放匹配与发散检测的“身份键”
+Label   string    // 可选人类可读标签；纯元数据，绝不参与重放匹配
+Payload []byte    // 序列化的执行结果 (JSON)
+Err     string    // 错误标记，空表示成功
 }
 ```
 
@@ -70,14 +74,17 @@ UpdatedAt time.Time
 
 ### 3.4 ExecutionConfig (执行配置)
 
-用于传递给 `Execute` 的策略配置。
+用于传递给原语的策略配置。`Execute` 使用其全部字段；`Sleep`/`Await` 仅使用 `Label`
+（`Timeout`/`Retry` 对它们无意义）。
 
 ```go
 type ExecutionConfig struct {
+Label   string        // 可选人类可读标签；纯元数据，绝不参与重放匹配
 Timeout time.Duration
 Retry   RetryPolicy
 }
 type Option func (*ExecutionConfig)
+// WithLabel / WithTimeout / WithRetry 为可用 Option。
 ```
 
 ## 4. 存储接口
@@ -204,17 +211,16 @@ type WorkflowContext struct {
 	ctx      context.Context // 封装标准 context，用于传递取消信号等
 	runID    RunID
 	input    []byte // 启动参数（JSON），Input 原语从中反序列化
-	history  map[StepID]*LogEntry // 内存索引，加速查找
+	journal  []LogEntry // 已加载历史 + 本次 run 新提交条目（按追加序）
+	cursor   int        // 下一个待消费的 journal 位置
 	isReplay bool
 	clock    Clock
 	writer   store.Writer  // 追加日志
 	mailbox  store.Mailbox // Await 原语的信号存取
 	returnData any // Return 原语暂存结果，引擎捕获 ErrReturn 后读取
 	// 引擎内部状态（业务代码不应直接使用）：
-	callCounters  map[string]int    // 每个调用点的执行序号，用于循环中生成唯一 StepID
-	stepOrigins   map[StepID]string // 最终 StepID 首次出现的调用点，用于检测显式 StepID 跨调用点复用
-	sleepDeadline time.Time         // Sleep 设置：ErrSleeping 时引擎据此注册唤醒定时器
-	awaitDeadline time.Time         // Await 设置：ErrAwaiting 时引擎据此注册超时定时器（零值表示无超时）
+	sleepDeadline time.Time // Sleep 设置：ErrSleeping 时引擎据此注册唤醒定时器
+	awaitDeadline time.Time // Await 设置：ErrAwaiting 时引擎据此注册超时定时器（零值表示无超时）
 }
 ```
 
@@ -234,38 +240,30 @@ func Input[T any](wf *WorkflowContext) (T, error)
 
 ```go
 // Execute 执行幂等步骤，通过泛型函数实现，R 为返回类型
-func Execute[R any](wf *WorkflowContext, stepID StepID, fn func (ctx context.Context) (R, error), opts ...Option) (R, error)
+func Execute[R any](wf *WorkflowContext, fn func (ctx context.Context) (R, error), opts ...Option) (R, error)
 ```
 
 **逻辑：**
 
-1. 生成有效 StepID（见下“动态步骤 ID 生成”），查询 `history` 索引。
+1. **按位置消费** journal：尝试取下一条 KindExec 条目（见 6.6“位置重放模型”）。
 2. 若命中且无错误：反序列化 Payload 返回 (跳过执行)。
-3. 若未命中：在 `Timeout` 与 `Retry` 约束下执行 `fn`，**成功后**记录 LogEntry，返回结果。
-4. 支持 `WithTimeout`, `WithRetry` 灵活配置。
+3. 若未命中（位置耗尽）：在 `Timeout` 与 `Retry` 约束下执行 `fn`，**成功后**追加 KindExec 日志条目，返回结果。
+4. 支持 `WithLabel`（可读标签）、`WithTimeout`、`WithRetry` 灵活配置。
 5. **只记录成功**：失败（重试耗尽）不写日志，以便恢复时重新执行，维持确定性。`LogEntry.Err` 字段在
    Execute 记录中恒为空，保留该字段供未来扩展与 Await 等原语复用。
-6. 动态步骤 ID 生成：在循环结构中，静态行号无法保证唯一性。StepID 生成策略应为 BaseStepID (file:line) + RuntimeIndex (
-   调用序号)。引擎需维护每个静态调用点的调用计数器，以确保重放时能生成与首次执行完全一致的 ID 序列。
-   - 若传入显式 `stepID`，以其作为 Base；否则以调用点 `file:line` 作为 Base。
-   - 序号 > 1 时附加 `#N` 后缀（如 `step#2`）。
-   - 计数器在每个 `WorkflowContext`（即每次 run）内独立，重放时同一代码路径产生相同序列。
-7. **跨调用点冲突检测**：若两个不同调用点产生相同的最终 StepID（典型场景：多处传入同一显式
-   `stepID`），Execute 返回 `ErrStepIDCollision` 而非让后者静默命中前者的历史记录（串台）。同一调用点
-   在循环中复用同一显式 `stepID` 是合法的——由 `#N` 序号去重。
 
 ### 6.3 Sleep (睡眠原语)
 
 支持长时等待，不占用线程。
 
 ```go
-func (wf *WorkflowContext) Sleep(d time.Duration) error
+func (wf *WorkflowContext) Sleep(d time.Duration, opts ...Option) error
 ```
 
 **逻辑：**
 
 1. **确定性与持久化**：
-    - 调用内部幂等步骤 `Execute` 记录 `deadline`。
+    - 按位置消费/记录 `deadline`（一条 KindSleep 条目）。支持 `WithLabel` 附加可读标签。
     - 首次执行时：计算 `deadline = clock.Now().Add(d)` 并记录。
     - 重放执行时：从历史日志中恢复已记录的 `deadline`。
 2. **完全非阻塞判定** (彻底解决 Worker 阻塞问题)：
@@ -281,22 +279,24 @@ func (wf *WorkflowContext) Sleep(d time.Duration) error
 支持跨重启等待外部事件。
 
 ```go
-func (wf *WorkflowContext) Await(signal Signal, timeout time.Duration) ([]byte, error)
+func (wf *WorkflowContext) Await(signal Signal, timeout time.Duration, opts ...Option) ([]byte, error)
 ```
 
-**逻辑：**
+**逻辑（条目按日志追加顺序消费）：**
 
-1. 查询历史中该调用点的记录：若 `Err == "await_timeout"`（超时决策已持久化），直接复现超时分支返回
-   `ErrAwaitTimeout`，**不再查询信箱**；若无错误（成功消费记录），直接返回历史 payload。这一步是确定性
-   的关键：重放结果不依赖信箱当前态，迟到的信号无法改变已定型的结果。
-2. 若设置了 `timeout > 0`，用独立的 `:deadline` StepID 记录/恢复超时截止时刻（首次计算
+1. 若 `timeout > 0`：按位置消费/记录超时截止时刻（一条 KindAwaitDeadline 条目，首次计算
    `clock.Now().Add(timeout)` 并持久化，重放时恢复同一值）。
-3. 若 deadline 已到且信箱确无信号：持久化超时决策（写 `Err == "await_timeout"` 的记录）后返回
+2. 按位置消费已决策的结果：若为 KindAwaitTimeout（超时决策已持久化），直接复现超时分支返回
+   `ErrAwaitTimeout`，**不再查询信箱**；若为 KindAwait（成功消费记录），直接返回历史 payload。这一步是
+   确定性的关键：重放结果不依赖信箱当前态，迟到的信号无法改变已定型的结果。
+3. 若尚未决策、deadline 已到且信箱确无信号：持久化超时决策（追加 KindAwaitTimeout 条目）后返回
    `ErrAwaitTimeout`。业务代码可据此降级（如返回默认值）。
 4. 检查 `Mailbox` 是否已有信号（Fetch）。
-5. 若有：记录消费日志（成功记录）、调用 `Mailbox.Ack` 删除信号、返回数据。
+5. 若有：追加 KindAwait 消费条目、调用 `Mailbox.Ack` 删除信号、返回数据。
 6. 若无：设置 `awaitDeadline`，返回 `ErrAwaiting`。引擎捕获后更新状态为 `StatusAwaiting` 并释放
    Goroutine，等待外部 `Signal` 或超时定时器唤醒。
+
+支持 `WithLabel` 附加可读标签；同一 Await 的 deadline 与 outcome 条目共享同一 label，便于排查。
 
 ### 6.5 Return (返回原语)
 
@@ -309,6 +309,27 @@ func (wf *WorkflowContext) Return(result any) error
 **实现机制：**
 摒弃 `panic` 机制，采用 Go 标准的 Error 返回模式。内部将结果暂存至 `wf.returnData`，并返回哨兵错误 `ErrReturn`。业务代码需使用
 `return wf.Return(result)` 语法终止当前调用栈。引擎捕获到 `ErrReturn` 后，读取暂存结果并标记成功。
+
+### 6.6 位置重放模型（Positional Journal）
+
+幂等与重放不再依赖任何字符串键（无 StepID、无 `file:line` 锚定），而是基于**有序日志 + 游标**：
+
+- `journal []LogEntry`：已加载历史 + 本次 run 新提交条目，按追加顺序排列；`cursor` 指向下一个待消费位置。
+- `consume(want ...EntryKind)`：按位置取下一条条目，仅当其 Kind 属于 `want` 时消费并推进 cursor。
+  - **命中**：返回该条目（重放跳过实际执行）。
+  - **位置耗尽**（cursor 已到末尾）：返回空，表示该步骤尚未执行（首次运行），由原语执行后 `commit`。
+  - **Kind 不符**：返回 `ErrJournalMismatch`——代码路径与历史发散，以失败显式暴露而非静默腐化。
+- `commit(kind, label, payload)`：持久化并追加一条新条目，推进 cursor 至末尾。
+
+**核心收益**：
+
+- **无行号漂移**：身份由位置决定，增删注释/调整行号不再偏移键、不破坏与既有日志的重放匹配。
+- **循环天然支持**：循环的每次迭代各占一条条目，无需调用计数器或 `#N` 后缀。
+- **Label 纯 cosmetic**：`consume` 只按 Kind 匹配，Label 写入即固化；修改代码中的 Label 不会改写已落盘的
+  历史，也不破坏重放——这正是相比旧行号 StepID 的关键优势。
+- **双重 divergence 守卫**：(a) `consume` 时 Kind 不符；(b) 业务函数终态返回（nil / ErrReturn）时若
+  `cursor != len(journal)`（有未被消费的残余条目，说明代码路径相较录制时缩短），均判定为
+  `ErrJournalMismatch` 失败。挂起（ErrSleeping/ErrAwaiting）路径不触发 (b)，因其尚未走完全程。
 
 ## 7. 引擎核心逻辑
 
@@ -331,7 +352,8 @@ type executionContext struct { // 引擎内部使用的扩展上下文
 引擎的核心处理流程：
 
 1. **并发控制**：尝试获取分布式锁 `Locker.Acquire`。
-2. **加载历史**：从存储读取所有 LogEntry，构建 `history` Map。
+2. **加载历史**：从存储读取所有 LogEntry（按追加顺序），作为 `journal` 工作副本；`cursor` 置 0，
+   `isReplay = len(logs) > 0`（run 开始时一次性锚定）。
     - **版本校验**：对比 `RunMeta.Version` 与当前注册的代码版本，不一致则拒绝重放，返回 `ErrVersionMismatch` 防止破坏确定性。
 3. **构建上下文**：创建 `executionContext`，注入依赖。
 4. **执行业务**：调用注册的 WorkflowFunc。
@@ -411,7 +433,7 @@ type Cloner interface {
 │   ├── options.go           # ExecutionConfig 与 Option 模式 (对应第 3.4 节)
 │   └── workflow.go          # WorkflowFunc 类型定义，注册表逻辑
 ├── model/                   # 核心领域模型与基础类型
-│   ├── types.go             # RunID, StepID, Signal 等命名类型 (对应第 3.1 节)
+│   ├── types.go             # EntryKind, RunID, Signal 等命名类型 (对应第 3.1 节)
 │   ├── log_entry.go         # LogEntry 结构体 (对应第 3.2 节)
 │   └── run_meta.go          # RunMeta, RunStatus 结构体 (对应第 3.3 节)
 ├── store/                   # 存储抽象层
@@ -450,7 +472,7 @@ type Cloner interface {
 * **约束规则**：每个 `WorkflowFunc` 必须拥有对应的集成测试，该测试需验证：**给定相同的输入与历史日志，执行结果必须完全一致。
   **
 * **强制手段**：测试框架应提供一个 `ReplayTester` 工具，自动对比“首次执行生成的日志”与“重放执行生成的日志”是否完全匹配（包括
-  StepID 顺序、Payload 内容）。
+  Kind/Label 顺序、Payload 内容）。
 
 ### 12.2 时间穿越约束
 
@@ -491,8 +513,9 @@ type Cloner interface {
 * **破坏性变更检测**：
 * 模拟一个旧版本生成的日志文件。
 * 使用新版本的 Engine 代码加载该日志。
-* 若日志中的 StepID 在新代码中已删除或逻辑变更，必须返回 `ErrVersionMismatch` 或明确的兼容性错误。
-* 若日志中的 StepID 对应的函数签名发生变化（如参数类型改变），重放反序列化必须失败。
+* 若日志中的条目在重放时位置/Kind 与新代码路径不一致（原语被删除或重排），必须返回 `ErrJournalMismatch`；
+  若代码语义发生破坏性变更，应通过 `WithVersion` 提升版本号触发 `ErrVersionMismatch`。
+* 若条目 Payload 对应的函数签名发生变化（如参数类型改变），重放反序列化必须失败。
 
 ### 12.6 基础设施 Mock 要求
 
@@ -500,7 +523,7 @@ type Cloner interface {
 
 1. **可控的 Mailbox**：支持手动 `Push` 信号，并验证 `Ack` 是否在正确的时机被调用。
 2. **可观测的 Locker**：支持查看当前锁的持有状态，模拟锁过期。
-3. **可搜索的 Log**：支持按 StepID 查询，用于验证日志写入的正确性。
+3. **可观测的 Log**：支持按追加顺序读取全部条目（`Reader.Read`），用于验证 Kind/Label/Payload 写入的正确性。
 
 ### 12.7 测试代码示例结构
 
@@ -516,10 +539,10 @@ func TestWorkflowDeterminism(t *testing.T) {
 
     var serviceCalls int32
     e.Register("MyWorkflow", func(wf *engine.WorkflowContext) error {
-        _, err := engine.Execute(wf, "step1", func(ctx context.Context) (int, error) {
+        _, err := engine.Execute(wf, func(ctx context.Context) (int, error) {
             atomic.AddInt32(&serviceCalls, 1)
             return 42, nil
-        })
+        }, engine.WithLabel("step1"))
         return err
     })
 
@@ -539,7 +562,7 @@ func TestWorkflowDeterminism(t *testing.T) {
 
     // 4. Verify Logs Identity
     replayLogs, _ := store.Read(ctx, runID)
-    // 重放日志必须与 golden 完全一致（StepID 顺序、Payload 内容、Err）。
+    // 重放日志必须与 golden 完全一致（Kind/Label 顺序、Payload 内容、Err）。
     if !logsEqual(goldenLogs, replayLogs) {
         t.Fatal("replay logs must match golden logs")
     }
@@ -574,17 +597,18 @@ func TestWorkflowDeterminism(t *testing.T) {
 1. **Execute 只记录成功**：失败不写日志，保证恢复时重新执行、维持确定性；`LogEntry.Err` 在 Execute
    记录中恒为空，保留以供扩展与 Await 等原语复用。
 2. **重试状态隔离**：状态化 `RetryPolicy` 实现 `Cloner`，引擎在每次 `Execute` 调用前克隆独立副本。
-3. **StepID 生成**：调用点（`file:line`）作为计数键；显式 `stepID` 优先作为 Base；序号 > 1 时附加 `#N`。
-   计数器按每次 run 独立重建，使重放复现完全一致的 ID 序列。调用点仅取文件名（不含目录路径），故跨机器
-   一致；但任何改变行号的编辑（即便仅增删注释）都会偏移隐式 StepID、破坏与既有日志的重放匹配——此类
-   重构应显式提供 `stepID`，或提升工作流版本。不同调用点复用同一显式 `stepID` 会触发
-   `ErrStepIDCollision`（见 6.2）。
+3. **位置重放（取代 StepID）**：引擎不生成任何字符串 StepID——`callerLocation`/`runtime.Caller`、
+   调用点计数器、`#N` 后缀、跨调用点冲突检测均已移除。重放按“位置 + Kind”消费日志条目（见 6.6）。
+   由此彻底消除行号漂移：任何改变行号的编辑（增删注释等）都不再影响重放匹配。代码路径与历史不一致时，
+   由 `consume` 的 Kind 校验或终态残余检查以 `ErrJournalMismatch` 显式失败；破坏性语义变更仍应通过
+   `WithVersion` 提升版本号。可选 `WithLabel` 写入人类可读标签，但 Label 纯属 cosmetic，绝不参与匹配。
 4. **Sleep / Await 唤醒的确定性**：唤醒定时器通道在 `scheduleWakeup` 的**同步阶段**注册（而非 goroutine 内），
    确保 FakeClock 下 deadline 锚定在当前时刻，避免与 `Advance` 发生注册竞态。
 5. **版本号默认值**：`Register` 未传 `WithVersion` 时，基于工作流名称计算稳定哈希；该默认值**无法感知代码
    变更**，生产环境建议始终显式提供版本，并在破坏性变更时手动提升。
-6. **Await 的超时**：通过独立的 `:deadline` StepID 持久化超时截止时刻，确保重放时确定性一致；超时未收到
-   信号时返回 `ErrAwaitTimeout`，业务代码可据此决定是否降级（如返回默认值）。
+6. **Await 的超时**：通过独立的 KindAwaitDeadline 条目（位置紧随其后的是 KindAwaitTimeout/KindAwait 决策条目）
+   持久化超时截止时刻，确保重放时确定性一致；超时未收到信号时返回 `ErrAwaitTimeout`，业务代码可据此决定
+   是否降级（如返回默认值）。
 7. **测试钩子**：`TestOptions{RunSync, NoAutoRecover}` 与 `RunOnce` 用于确定性测试；生产代码保持默认异步模式。
 8. **唤醒时刻按哨兵错误选取**：调度唤醒时以返回的哨兵错误决定使用哪个截止时刻
    （`ErrSleeping`→`sleepDeadline`、`ErrAwaiting`→`awaitDeadline`）。切勿取“任一非零字段”——当 Sleep 已

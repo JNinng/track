@@ -30,7 +30,8 @@ func (s *logMetaStore) Append(_ context.Context, runID model.RunID, entry model.
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	cp := model.LogEntry{
-		StepID:  entry.StepID,
+		Kind:    entry.Kind,
+		Label:   entry.Label,
 		Err:     entry.Err,
 		Payload: append([]byte(nil), entry.Payload...),
 	}

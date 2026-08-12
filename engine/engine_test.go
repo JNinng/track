@@ -52,10 +52,10 @@ func TestExecuteRecordsAndReplays(t *testing.T) {
 
 	var calls int32
 	e.Register("w", func(wf *WorkflowContext) error {
-		v, err := Execute(wf, "double", func(ctx context.Context) (int, error) {
+		v, err := Execute(wf, func(ctx context.Context) (int, error) {
 			atomic.AddInt32(&calls, 1)
 			return 21, nil
-		})
+		}, WithLabel("double"))
 		if err != nil {
 			return err
 		}
@@ -128,7 +128,7 @@ func TestRetryThenSucceed(t *testing.T) {
 
 	var attempts int32
 	e.Register("w", func(wf *WorkflowContext) error {
-		_, err := Execute(wf, "flaky", func(ctx context.Context) (int, error) {
+		_, err := Execute(wf, func(ctx context.Context) (int, error) {
 			n := atomic.AddInt32(&attempts, 1)
 			if n < 3 {
 				return 0, errors.New("transient")
@@ -147,15 +147,16 @@ func TestRetryThenSucceed(t *testing.T) {
 	}
 }
 
-func TestLoopStepIDUniqueness(t *testing.T) {
+// 循环中的幂等步骤：位置重放下每次迭代各占一条 KindExec 条目，
+// 重放时按位置逐条命中，fn 不再调用。
+func TestLoopPositionalReplay(t *testing.T) {
 	clk := clock.NewFakeClock()
 	e, s := newSyncEngine(t, clk)
 
 	var calls int32
 	e.Register("w", func(wf *WorkflowContext) error {
 		for i := 0; i < 5; i++ {
-			// 同一调用点在循环中多次调用：StepID 需自动附加序号。
-			_, err := Execute(wf, "", func(ctx context.Context) (int, error) {
+			_, err := Execute(wf, func(ctx context.Context) (int, error) {
 				atomic.AddInt32(&calls, 1)
 				return i, nil
 			})
@@ -174,19 +175,20 @@ func TestLoopStepIDUniqueness(t *testing.T) {
 	if len(logs) != 5 {
 		t.Fatalf("want 5 log entries, got %d", len(logs))
 	}
-	// 校验 5 个 StepID 互不相同。
-	seen := map[model.StepID]struct{}{}
-	for _, l := range logs {
-		if _, dup := seen[l.StepID]; dup {
-			t.Fatalf("duplicate StepID %s", l.StepID)
+	// 位置重放：身份由位置决定，条目 Kind 均为 KindExec。
+	for i, l := range logs {
+		if l.Kind != model.KindExec {
+			t.Fatalf("log[%d].Kind=%s, want %s", i, l.Kind, model.KindExec)
 		}
-		seen[l.StepID] = struct{}{}
 	}
-	// 重放：5 次均命中历史，fn 不再调用。
+	// 重放：5 次均按位置命中历史，fn 不再调用。
 	atomic.StoreInt32(&calls, 0)
 	e.run(context.Background(), rid)
 	if atomic.LoadInt32(&calls) != 0 {
 		t.Fatalf("replay re-executed loop steps: %d calls", calls)
+	}
+	if !logsEqual(logs, mustReadLogs(t, s, rid)) {
+		t.Fatal("replay logs differ from golden logs")
 	}
 }
 
@@ -214,61 +216,85 @@ func TestVersionMismatchOnReplay(t *testing.T) {
 	}
 }
 
-// 显式 StepID 在不同调用点被复用时，必须报错而非让第二个调用点静默命中
-// 第一个的历史记录（串台）。回归 ErrStepIDCollision。
-func TestExecuteRejectsCrossCallSiteStepIDReuse(t *testing.T) {
-	clk := clock.NewFakeClock()
-	e, _ := newSyncEngine(t, clk)
-	e.Register("w", func(wf *WorkflowContext) error {
-		v1, err := Execute(wf, "dup", func(ctx context.Context) (int, error) { return 1, nil })
-		if err != nil {
-			return err
-		}
-		// 不同调用点、同一显式 StepID：应返回 ErrStepIDCollision。
-		v2, err := Execute(wf, "dup", func(ctx context.Context) (int, error) { return 2, nil })
-		if err != nil {
-			return err
-		}
-		return wf.Return(v1 + v2)
-	})
-	rid, _ := e.Start(context.Background(), "w", nil)
-	m := awaitStatus(t, e, rid, time.Second)
-	if m.Status != model.StatusFailed {
-		t.Fatalf("status=%s, want Failed on StepID collision", m.Status)
-	}
-	// RunMeta.Err 是纯字符串，无法用 errors.Is 还原哨兵链；按消息内容校验。
-	if !strings.Contains(m.Err, "duplicate StepID") {
-		t.Fatalf("err=%q, want ErrStepIDCollision", m.Err)
-	}
-}
-
-// 同一显式 StepID 在同一调用点的循环中是合法的（由序号 #N 去重），不应报错。
-func TestExecuteLoopWithExplicitStepIDOK(t *testing.T) {
+// 终态时若历史存在未被消费的残余条目，说明代码路径相较录制时缩短
+// （如删除了某个原语调用），引擎必须以 ErrJournalMismatch 失败，而非静默成功。
+func TestJournalMismatchOnLeftoverEntries(t *testing.T) {
 	clk := clock.NewFakeClock()
 	e, s := newSyncEngine(t, clk)
 	e.Register("w", func(wf *WorkflowContext) error {
-		for i := 0; i < 3; i++ {
-			if _, err := Execute(wf, "iter", func(ctx context.Context) (int, error) { return i, nil }); err != nil {
+		return wf.Return("ok") // 不调用 Execute -> 孤儿条目不会被消费
+	})
+
+	// 预置一条孤儿 KindExec 历史，模拟"录制时执行过、当前代码已删除"。
+	rid := model.RunID("run-leftover")
+	if err := s.UpdateStatus(context.Background(), rid, model.StatusRunning,
+		store.WithName("w"), store.WithVersion(defaultVersion("w"))); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Append(context.Background(), rid, model.LogEntry{Kind: model.KindExec, Payload: []byte("1")}); err != nil {
+		t.Fatal(err)
+	}
+
+	e.run(context.Background(), rid)
+	m, _ := e.GetResult(context.Background(), rid)
+	if m.Status != model.StatusFailed {
+		t.Fatalf("status=%s, want Failed on journal drift", m.Status)
+	}
+	// RunMeta.Err 是纯字符串，无法用 errors.Is 还原哨兵链；按消息内容校验。
+	if !strings.Contains(m.Err, "journal mismatch") {
+		t.Fatalf("err=%q, want journal mismatch", m.Err)
+	}
+}
+
+// Label 是纯可读元数据：重放只按位置 + Kind 匹配。即使当前代码使用了
+// 与历史不同的 Label，重放仍命中历史条目、不重新执行、不改写已落盘的 Label。
+//
+// 这是位置日志相比旧行号 StepID 的核心收益：cosmetic 变更不破坏既有重放。
+func TestLabelIsCosmeticAcrossReplay(t *testing.T) {
+	clk := clock.NewFakeClock()
+	e, s := newSyncEngine(t, clk)
+
+	var calls int32
+	mk := func(label string) func(*WorkflowContext) error {
+		return func(wf *WorkflowContext) error {
+			v, err := Execute(wf, func(ctx context.Context) (int, error) {
+				atomic.AddInt32(&calls, 1)
+				return 7, nil
+			}, WithLabel(label))
+			if err != nil {
 				return err
 			}
+			return wf.Return(v)
 		}
-		return nil
-	})
+	}
+
+	// Run1：label="greet"。
+	e.Register("w", mk("greet"))
 	rid, _ := e.Start(context.Background(), "w", nil)
-	m := awaitStatus(t, e, rid, time.Second)
-	if m.Status != model.StatusSucceeded {
+	if m := awaitStatus(t, e, rid, time.Second); m.Status != model.StatusSucceeded {
 		t.Fatalf("status=%s err=%s", m.Status, m.Err)
 	}
-	logs := mustReadLogs(t, s, rid)
-	if len(logs) != 3 {
-		t.Fatalf("want 3 log entries, got %d", len(logs))
+	golden := mustReadLogs(t, s, rid)
+	if len(golden) != 1 || golden[0].Kind != model.KindExec || golden[0].Label != "greet" {
+		t.Fatalf("golden=%+v", golden)
 	}
-	seen := map[model.StepID]struct{}{}
-	for _, l := range logs {
-		seen[l.StepID] = struct{}{}
+
+	// “代码变更”：同一工作流名改用 label="renamed"（版本未变）。
+	atomic.StoreInt32(&calls, 0)
+	e.Register("w", mk("renamed"))
+	// 重置为非终态以允许重新 run。
+	if err := s.UpdateStatus(context.Background(), rid, model.StatusRunning); err != nil {
+		t.Fatal(err)
 	}
-	if len(seen) != 3 {
-		t.Fatalf("loop StepIDs not unique: %v", seen)
+	e.run(context.Background(), rid)
+
+	// 重放命中历史（KindExec 匹配），fn 不再执行；落盘 Label 仍是 "greet"。
+	if got := atomic.LoadInt32(&calls); got != 0 {
+		t.Fatalf("label change caused re-execution: %d calls", got)
+	}
+	replay := mustReadLogs(t, s, rid)
+	if replay[0].Label != "greet" {
+		t.Fatalf("label rewritten to %q; cosmetic change must not rewrite history", replay[0].Label)
 	}
 }
 

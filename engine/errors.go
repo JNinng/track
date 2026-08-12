@@ -24,12 +24,13 @@ var (
 	// ErrWorkflowNotFound 表示引用了未注册的工作流名称。
 	ErrWorkflowNotFound = errors.New("workflow: not registered")
 
-	// ErrStepIDCollision 表示同一显式 StepID 在不同调用点被复用。
+	// ErrJournalMismatch 表示重放时按位置消费的日志条目与当前代码路径不一致。
 	//
-	// 这会导致后一个调用点命中前者的历史记录而静默跳过执行（串台），
-	// 破坏幂等性与确定性。显式 StepID 必须在每个调用点保持唯一；
-	// 若需在循环中复用，应省略显式值由引擎附加 #N 序号。
-	ErrStepIDCollision = errors.New("workflow: duplicate StepID across call sites")
+	// 触发情形：重放到的位置条目 Kind 与当前原语预期不符，或业务函数终态返回时
+	// 仍有未被消费的历史残余（代码路径相较录制时缩短）。二者都意味着代码已相对
+	// 历史日志发生变更，继续重放会破坏幂等性与确定性，故以失败显式暴露，而非静默腐化。
+	// 提升工作流版本（WithVersion）可主动声明破坏性变更。
+	ErrJournalMismatch = errors.New("workflow: journal mismatch on replay")
 )
 
 // 以下 IsXxx 辅助函数供业务代码判断原语产生的哨兵错误（支持 errors.Is 包装）。
@@ -49,5 +50,5 @@ func IsReturn(err error) bool { return errors.Is(err, ErrReturn) }
 // IsVersionMismatch 报告 err 是否为版本不一致错误。
 func IsVersionMismatch(err error) bool { return errors.Is(err, ErrVersionMismatch) }
 
-// IsStepIDCollision 报告 err 是否为显式 StepID 跨调用点复用错误。
-func IsStepIDCollision(err error) bool { return errors.Is(err, ErrStepIDCollision) }
+// IsJournalMismatch 报告 err 是否为重放日志与代码路径不一致错误。
+func IsJournalMismatch(err error) bool { return errors.Is(err, ErrJournalMismatch) }

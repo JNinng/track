@@ -10,21 +10,33 @@ import (
 // 默认 Worker 数量。
 const defaultWorkers = 8
 
-// ExecutionConfig 是传递给 Execute 的策略配置（设计文档 3.4 节）。
+// ExecutionConfig 是传递给原语的策略配置（设计文档 3.4 节）。
+//
+// Execute 使用其全部字段；Sleep/Await 仅使用 Label（Timeout/Retry 对它们无意义）。
 type ExecutionConfig struct {
+	// Label 可选的人类可读标签，写入日志条目供调试。绝不参与重放匹配。
+	Label   string
 	Timeout time.Duration
 	Retry   policy.RetryPolicy
 }
 
-// Option 用于配置 ExecutionConfig，通过 WithTimeout / WithRetry 应用。
+// Option 用于配置 ExecutionConfig，通过 WithLabel / WithTimeout / WithRetry 应用。
 type Option func(*ExecutionConfig)
 
-// WithTimeout 设置单次步骤执行的超时时长。
+// WithLabel 为步骤附加一个人类可读标签，写入日志条目便于排查。
+//
+// Label 纯属可读元数据：重放只按位置 + Kind 匹配，修改 Label 不会破坏
+// 既有日志的重放（cosmetic 安全）。
+func WithLabel(s string) Option {
+	return func(c *ExecutionConfig) { c.Label = s }
+}
+
+// WithTimeout 设置单次步骤执行的超时时长（仅 Execute 生效）。
 func WithTimeout(d time.Duration) Option {
 	return func(c *ExecutionConfig) { c.Timeout = d }
 }
 
-// WithRetry 设置重试策略。
+// WithRetry 设置重试策略（仅 Execute 生效）。
 func WithRetry(p policy.RetryPolicy) Option {
 	return func(c *ExecutionConfig) { c.Retry = p }
 }

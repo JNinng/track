@@ -3,7 +3,6 @@ package engine
 import (
 	"crypto/sha256"
 	"encoding/hex"
-	"fmt"
 )
 
 // WorkflowFunc 是业务工作流的统一签名。
@@ -40,15 +39,4 @@ func WithVersion(v string) RegisterOption {
 func defaultVersion(name string) string {
 	sum := sha256.Sum256([]byte(name))
 	return hex.EncodeToString(sum[:8])
-}
-
-// formatStepID 组合 base 与序号（序号 > 1 时附加）。
-func formatStepID(base string, seq int) string {
-	if base == "" {
-		base = "step"
-	}
-	if seq > 1 {
-		return fmt.Sprintf("%s#%d", base, seq)
-	}
-	return base
 }

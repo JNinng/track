@@ -109,7 +109,7 @@ func TestAsyncEngineEndToEnd(t *testing.T) {
 	defer e.Stop(context.Background())
 
 	e.Register("w", func(wf *WorkflowContext) error {
-		x, err := Execute(wf, "add", func(ctx context.Context) (int, error) { return 40, nil })
+		x, err := Execute(wf, func(ctx context.Context) (int, error) { return 40, nil }, WithLabel("add"))
 		if err != nil {
 			return err
 		}
