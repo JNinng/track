@@ -13,7 +13,7 @@
 
 ## 2. 核心概念
 
-引擎采用**日志驱动**架构。工作流的每一次关键动作（执行步骤、睡眠、等待信号）都会生成一条不可变的日志记录。
+引擎采用**日志驱动**架构。工作流的每一次关键动作（执行步骤、睡眠、等待信号、返回终态结果）都会生成一条不可变的日志记录。
 
 - **位置日志（Positional Journal）**：日志按追加顺序构成有序序列。重放时每个原语**按位置**消费下一条历史记录，身份由“位置 + Kind”决定，不依赖任何字符串键。这是幂等性的基础：若该位置已有匹配 Kind 的记录，则跳过实际执行。
 - **EntryKind**：日志条目的功能类别（exec/sleep/await 等）。重放时引擎据此校验位置上的条目是否与当前原语预期一致，不符即判定为代码与历史发散（`ErrJournalMismatch`）。
@@ -45,6 +45,7 @@ KindSleep         = "sleep"           // Sleep 原语的截止时刻记录
 KindAwaitDeadline = "await_deadline"  // Await 原语的超时截止时刻记录（仅 timeout>0 时产生）
 KindAwait         = "await"           // Await 原语成功消费信号后的载荷记录
 KindAwaitTimeout  = "await_timeout"   // Await 原语持久化的超时决策（重放时复现超时分支）
+KindReturn        = "return"          // Return 原语持久化的终态结果记录（重放时复现输出，确保确定性）
 ```
 
 ### 3.2 LogEntry (日志实体)
@@ -351,12 +352,26 @@ func (wf *WorkflowContext) Await(signal Signal, timeout time.Duration, opts ...O
 立即终止工作流并返回结果。
 
 ```go
-func (wf *WorkflowContext) Return(result any) error
+func (wf *WorkflowContext) Return(result any, opts ...Option) error
 ```
 
-**契约**：采用 Go 标准的 Error 返回模式（不使用 `panic`）。内部将结果暂存，返回哨兵错误 `ErrReturn`。
-业务代码使用 `return wf.Return(result)` 语法终止当前调用栈；引擎捕获 `ErrReturn` 后读取暂存结果并
-标记成功。
+**契约：**
+
+1. 采用 Go 标准的 Error 返回模式（不使用 `panic`）。
+2. **按位置消费** journal：尝试取下一条 KindReturn 条目（见 6.6）。
+    - **命中**：以历史 payload 为确定性的真相还原输出（**忽略**本次传入的 `result`），返回 `ErrReturn`。
+    - **未命中**（位置耗尽）：序列化 `result`，追加一条 KindReturn 日志条目并返回 `ErrReturn`。
+3. 内部将序列化后的 payload 暂存，引擎捕获 `ErrReturn` 后直接以该 payload 作为输出标记成功。
+4. 支持 `WithLabel`（可读标签，不影响重放匹配）。
+
+**为什么要记录终态结果（契约）**：与 Execute「记录成功结果」同理——`Return` 的参数可能依赖未被日志
+覆盖的非确定性源（如 `time.Now()`、`rand`、Execute 之外的外部读取）。若不落盘，进程在「业务函数已
+到达 Return、但终态 `UpdateStatus` 尚未落盘」之间崩溃，恢复重放时重新计算 `result` 将与首次执行不一致，
+违反「崩溃后精确复现同一执行」的核心不变量。记录 KindReturn 后，重放以历史值为准，彻底闭合该缺口。
+经 `Return` 结束的实例，其日志最后一条必为 KindReturn——日志因此自洽，仅凭 journal 即可判终态并还原输出。
+
+**`return nil` 与 `Return` 的区别**：业务函数以普通 `return nil` 结束（未调用 Return 原语）表示「正常完成、
+无显式输出」，**不**记录任何条目；其终态完整性由 6.6 的发散守卫 (b) 保证。仅有显式 `Return` 才落盘 KindReturn。
 
 ### 6.6 位置重放模型（Positional Journal）
 
@@ -379,6 +394,8 @@ func (wf *WorkflowContext) Return(result any) error
 - **双重 divergence 守卫**：(a) `consume` 时 Kind 不符；(b) 业务函数终态返回（`nil` / `ErrReturn`）时
   若 `cursor != len(journal)`（有未被消费的残余条目，说明代码路径相较录制时缩短），均判定为
   `ErrJournalMismatch` 失败。挂起（ErrSleeping/ErrAwaiting）路径不触发 (b)，因其尚未走完全程。
+  `Return` 自身会消费一条 KindReturn：若录制时以 Return 结束、而新代码改用 `return nil`（删除了 Return），
+  残留的 KindReturn 即由守卫 (b) 捕获为发散。
 
 ## 7. 引擎核心逻辑
 
@@ -399,7 +416,7 @@ func (wf *WorkflowContext) Return(result any) error
 5. **加载历史**：从存储读取所有 LogEntry（按追加顺序）作为 `journal` 工作副本；`cursor` 置 0，
    `isReplay = len(logs) > 0`（run 开始时一次性锚定）。
 6. **标记运行中**并执行业务函数，按返回的哨兵错误转换状态：
-    - 捕获 `ErrReturn` -> 校验历史无残余（见 6.6 (b)），标记成功并提取结果。
+    - 捕获 `ErrReturn` -> 校验历史无残余（见 6.6 (b)），以落盘的 KindReturn payload 作为输出标记成功。
     - 业务函数普通返回 `nil` -> 同样校验历史无残余，标记成功。
     - 捕获 `ErrSleeping` -> 标记 `StatusAwaiting`，以 `sleepDeadline` 注册唤醒定时器。
     - 捕获 `ErrAwaiting` -> 标记 `StatusAwaiting`，以 `awaitDeadline` 注册超时定时器（零值表示不注册

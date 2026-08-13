@@ -6,7 +6,7 @@ package model
 // 都会生成一条不可变的 LogEntry。引擎按追加顺序消费这些条目实现幂等与重放：
 // 重放时每个原语按位置消费下一条历史记录，而非按字符串键查找。
 type LogEntry struct {
-	// Kind 标识条目的功能类别（exec/sleep/await 等）。
+	// Kind 标识条目的功能类别（exec/sleep/await/return 等）。
 	//
 	// 重放时引擎据此与当前原语匹配：位置耗尽表示首次执行；Kind 不符即判定为
 	// 代码与历史发散（ErrJournalMismatch），避免静默腐化。Kind 是条目的身份键。
@@ -22,7 +22,8 @@ type LogEntry struct {
 	//
 	// 注意：当前 Execute 原语仅在步骤成功时记录日志（Err 恒为空），
 	// 以保证失败步骤在恢复时能够重新执行，维持确定性。Await 的超时决策
-	// 以 Kind=KindAwaitTimeout 的条目记录（Payload 为空）。
+	// 以 Kind=KindAwaitTimeout 的条目记录（Payload 为空）。Return 的终态
+	// 结果以 Kind=KindReturn 记录（Payload 为输出的 JSON，Err 恒为空）。
 	Err string
 }
 
@@ -38,4 +39,11 @@ const (
 	KindAwait EntryKind = "await"
 	// KindAwaitTimeout 标识 Await 原语持久化的超时决策（重放时复现超时分支）。
 	KindAwaitTimeout EntryKind = "await_timeout"
+	// KindReturn 标识 Return 原语持久化的终态结果记录。
+	//
+	// 与 Execute「记录成功结果」同理：重放时按位置命中即以历史 payload 为
+	// 确定性真相还原输出，避免 Return 参数中的非确定性源（如 time.Now）
+	// 在崩溃恢复重放时发散。是工作流的终态标记——经 Return 结束的实例
+	// 其日志最后一条即 KindReturn。
+	KindReturn EntryKind = "return"
 )

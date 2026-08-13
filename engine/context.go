@@ -34,8 +34,10 @@ type WorkflowContext struct {
 	writer   store.Writer  // 用于追加日志
 	mailbox  store.Mailbox // 用于 Await 的信号存取
 
-	// returnData 由 Return 原语暂存结果，引擎捕获 ErrReturn 后读取。
-	returnData any
+	// returnData 由 Return 原语暂存已序列化的终态结果（落盘的 KindReturn payload），
+	// 引擎捕获 ErrReturn 后直接作为输出写入 RunMeta。首次执行与重放统一为 []byte：
+	// 重放命中时即历史 payload 本身，避免对 any 做类型猜测与二次序列化。
+	returnData []byte
 
 	// sleepDeadline 由 Sleep 设置：当返回 ErrSleeping 时，引擎据此注册唤醒定时器。
 	sleepDeadline time.Time
@@ -315,10 +317,36 @@ func (wf *WorkflowContext) Await(signal model.Signal, timeout time.Duration, opt
 
 // Return 立即终止工作流并返回结果（设计文档 6.5 节）。
 //
-// 摒弃 panic 机制：内部将结果暂存至 wf.returnData，返回哨兵错误 ErrReturn。
-// 业务代码使用 `return wf.Return(result)` 终止当前调用栈；引擎捕获
-// ErrReturn 后读取暂存结果并标记成功。
-func (wf *WorkflowContext) Return(result any) error {
-	wf.returnData = result
+// 与 Execute「记录成功结果」同构：按位置消费/记录终态结果（一条 KindReturn 条目）。
+// 重放命中时以历史 payload 为确定性真相还原输出，忽略本次传入的 result——
+// 这正是记录的本意：Return 参数可能含未被日志覆盖的非确定性源（如 time.Now），
+// 若不落盘，崩溃恢复重放时重新计算将发散，违反「崩溃后精确复现」契约。
+//
+// 内部将序列化后的 payload 暂存至 wf.returnData 并返回哨兵错误 ErrReturn。
+// 业务代码使用 `return wf.Return(result)` 终止当前调用栈；引擎捕获 ErrReturn
+// 后直接以该 payload 作为输出标记成功。可选 WithLabel 附加可读标签（不影响重放匹配）。
+func (wf *WorkflowContext) Return(result any, opts ...Option) error {
+	cfg := defaultExecConfig()
+	for _, o := range opts {
+		o(&cfg)
+	}
+
+	// 重放命中：历史 KindReturn 是确定性的真相，忽略本次计算的 result。
+	if e, err := wf.consume(model.KindReturn); err != nil {
+		return err
+	} else if e != nil {
+		wf.returnData = e.Payload
+		return ErrReturn
+	}
+
+	// 首次执行：序列化并持久化终态结果。
+	payload, err := json.Marshal(result)
+	if err != nil {
+		return err
+	}
+	if err := wf.commit(model.KindReturn, cfg.Label, payload); err != nil {
+		return err
+	}
+	wf.returnData = payload
 	return ErrReturn
 }

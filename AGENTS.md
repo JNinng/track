@@ -62,6 +62,13 @@ These are easy to break silently. Each is a hard contract in `docs/track.md`:
   replay of existing journals.
 - **Execute records success only.** A failed step writes **no** log; on recovery
   it re-executes. `LogEntry.Err` in a KindExec record is always empty.
+- **Return records its terminal result.** `Return` appends a `KindReturn` entry
+  (payload = marshaled result); on replay the recorded payload is authoritative
+  and the freshly-computed argument is **ignored**. This closes the determinism
+  hole where a non-deterministic `Return` argument (e.g. `time.Now()`, a counter)
+  would diverge across crash-recovery replay. A plain `return nil` completion
+  writes **no** entry — only an explicit `Return` does. Adding/removing a `Return`
+  is a journal-shape change; bump `WithVersion` when it must fail loud on old journals.
 - **commit-before-Ack.** `Await` must persist the `KindAwait` decision *before*
   calling `Mailbox.Ack`. An `Ack` failure is non-fatal (orphan signal, leak not
   determinism bug) — never fail the workflow on it.

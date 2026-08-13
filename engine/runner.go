@@ -2,7 +2,6 @@ package engine
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
@@ -98,15 +97,11 @@ func (e *Engine) run(ctx context.Context, runID model.RunID) {
 		}
 		e.succeed(ctx, runID, nil)
 	case errors.Is(runErr, ErrReturn):
-		out, mErr := json.Marshal(wf.returnData)
-		if mErr != nil {
-			e.fail(ctx, runID, mErr.Error())
-			return
-		}
+		// returnData 已是落盘的 KindReturn payload（JSON），作为确定性真相直接写入输出。
 		if e.failOnJournalDrift(ctx, runID, wf) {
 			return
 		}
-		e.succeed(ctx, runID, out)
+		e.succeed(ctx, runID, wf.returnData)
 	case errors.Is(runErr, ErrSleeping):
 		// 挂起：等待睡眠 deadline 到达后唤醒。
 		if err := e.store.UpdateStatus(ctx, runID, model.StatusAwaiting); err != nil {

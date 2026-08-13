@@ -138,6 +138,34 @@ func TestLockerExpire(t *testing.T) {
 	}
 }
 
+// New(WithLease(d)) 应将 Locker 租约改为 d：越过 d 后锁可被接管。
+// 对照默认 30s 租约在同一时刻仍持有，证明选项确实生效。
+func TestNewWithLease(t *testing.T) {
+	now := time.Now()
+
+	// 自定义租约 1s。
+	custom := New(WithLease(time.Second))
+	custom.SetNow(func() time.Time { return now }) // Store.SetNow 现唯一指向 Locker 时钟
+	rid := model.RunID("lease-custom")
+	if ok, _ := custom.Acquire(ctxn(), rid); !ok {
+		t.Fatal("acquire failed")
+	}
+	custom.SetNow(func() time.Time { return now.Add(2 * time.Second) })
+	if ok, _ := custom.Acquire(ctxn(), rid); !ok {
+		t.Fatal("WithLease(1s): should acquire after 1s lease expiry")
+	}
+
+	// 默认 30s 租约：2s 处仍持有（不可接管）。
+	def := New()
+	def.SetNow(func() time.Time { return now })
+	rid2 := model.RunID("lease-default")
+	def.Acquire(ctxn(), rid2)
+	def.SetNow(func() time.Time { return now.Add(2 * time.Second) })
+	if ok, _ := def.Acquire(ctxn(), rid2); ok {
+		t.Fatal("default 30s lease should still be held at 2s")
+	}
+}
+
 func TestMailboxPushFetchAck(t *testing.T) {
 	mb := NewMailbox()
 	rid := model.RunID("r1")

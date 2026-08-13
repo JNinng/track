@@ -305,7 +305,9 @@ func TestLabelIsCosmeticAcrossReplay(t *testing.T) {
 		t.Fatalf("status=%s err=%s", m.Status, m.Err)
 	}
 	golden := mustReadLogs(t, s, rid)
-	if len(golden) != 1 || golden[0].Kind != model.KindExec || golden[0].Label != "greet" {
+	// golden = [KindExec(greet), KindReturn]：Execute 步骤 + Return 终态记录。
+	if len(golden) != 2 || golden[0].Kind != model.KindExec || golden[0].Label != "greet" ||
+		golden[1].Kind != model.KindReturn {
 		t.Fatalf("golden=%+v", golden)
 	}
 
