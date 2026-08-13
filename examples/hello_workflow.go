@@ -64,12 +64,12 @@ func main() {
 		fmt.Printf("error:  %s\n", result.Err)
 	}
 
-	// 5. 读取该实例的全部重放日志并打印。
-	logs, err := getReplayLogs(context.Background(), store, runID)
+	// 5. 读取该实例的全部日志（journal）并打印。
+	logs, err := readJournal(context.Background(), store, runID)
 	if err != nil {
 		log.Fatal(err)
 	}
-	fmt.Println("replay logs:")
+	fmt.Println("journal:")
 	for i, l := range logs {
 		label := l.Label
 		if label == "" {
@@ -79,9 +79,9 @@ func main() {
 	}
 }
 
-// getReplayLogs 返回指定运行实例的全部重放日志（按追加顺序）。
+// readJournal 返回指定运行实例的全部日志（按追加顺序）。
 // store.Reader 是日志读取的最小接口，任何满足它的后端（如 memory.Store）均可传入。
-func getReplayLogs(ctx context.Context, r store.Reader, runID model.RunID) ([]model.LogEntry, error) {
+func readJournal(ctx context.Context, r store.Reader, runID model.RunID) ([]model.LogEntry, error) {
 	return r.Read(ctx, runID)
 }
 

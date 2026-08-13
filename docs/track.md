@@ -619,10 +619,10 @@ func TestWorkflowDeterminism(t *testing.T) {
     // serviceCalls == 0
 
     // 4. Verify Logs Identity
-    replayLogs, _ := store.Read(ctx, runID)
-    // 重放日志必须与 golden 完全一致（Kind/Label 顺序、Payload 内容、Err）。
-    if !logsEqual(goldenLogs, replayLogs) {
-        t.Fatal("replay logs must match golden logs")
+    gotLogs, _ := store.Read(ctx, runID)
+    // 重放后读出的日志必须与 golden 完全一致（Kind/Label 顺序、Payload 内容、Err）。
+    if !logsEqual(goldenLogs, gotLogs) {
+        t.Fatal("journal must match golden logs")
     }
 }
 ```

@@ -50,5 +50,5 @@ func IsReturn(err error) bool { return errors.Is(err, ErrReturn) }
 // IsVersionMismatch 报告 err 是否为版本不一致错误。
 func IsVersionMismatch(err error) bool { return errors.Is(err, ErrVersionMismatch) }
 
-// IsJournalMismatch 报告 err 是否为重放日志与代码路径不一致错误。
+// IsJournalMismatch 报告 err 是否为重放时 journal 与代码路径不一致错误。
 func IsJournalMismatch(err error) bool { return errors.Is(err, ErrJournalMismatch) }

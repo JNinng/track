@@ -93,9 +93,9 @@ func TestWorkflowDeterminism(t *testing.T) {
 	}
 
 	// 日志同一性断言：重放生成的日志必须与 Golden Master 完全匹配。
-	replay := mustReadLogs(t, s, rid)
-	if !logsEqual(golden, replay) {
-		t.Fatal("replay logs must match golden logs")
+	got := mustReadLogs(t, s, rid)
+	if !logsEqual(golden, got) {
+		t.Fatal("journal must match golden logs")
 	}
 
 	// 输出同一性。

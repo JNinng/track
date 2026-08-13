@@ -79,7 +79,7 @@ func HelloWorkflow(wf *engine.WorkflowContext) error {
 }
 ```
 
-更完整的示例（含 `Sleep` / `Await` / 信号投递 / 重放日志打印）见 [`examples/hello_workflow.go`](examples/hello_workflow.go)。
+更完整的示例（含 `Sleep` / `Await` / 信号投递 / 日志（journal）打印）见 [`examples/hello_workflow.go`](examples/hello_workflow.go)。
 
 ## 执行原语
 

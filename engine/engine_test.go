@@ -93,7 +93,7 @@ func TestExecuteRecordsAndReplays(t *testing.T) {
 		t.Fatalf("replay called fn %d times, want 0 (non-idempotent)", calls)
 	}
 	if !logsEqual(golden, mustReadLogs(t, s, rid)) {
-		t.Fatal("replay logs differ from golden logs")
+		t.Fatal("journal differs from golden logs")
 	}
 }
 
@@ -188,7 +188,7 @@ func TestLoopPositionalReplay(t *testing.T) {
 		t.Fatalf("replay re-executed loop steps: %d calls", calls)
 	}
 	if !logsEqual(logs, mustReadLogs(t, s, rid)) {
-		t.Fatal("replay logs differ from golden logs")
+		t.Fatal("journal differs from golden logs")
 	}
 }
 
