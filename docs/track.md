@@ -246,6 +246,13 @@ func WithQueueSize(n int) EngineOption
 func WithRecoverInterval(d time.Duration) EngineOption
 ```
 
+**`Signal` 的目标校验契约**：`Signal` 必须先确认目标实例存在且非终态，再持久化信号并唤醒，
+避免向不存在的实例写入孤儿信号——
+1. **实例不存在**：返回 `ErrNotFound`（不得静默成功，也不得持久化信号）。
+2. **实例已终态**（Succeeded / Failed / Cancelled）：视为 no-op，返回 `nil`（信号对终态实例
+   无意义，不持久化、不唤醒）。
+3. **实例非终态**：持久化信号后投递队列唤醒。`payload` 为 `nil` 时存空载荷（仍是合法信号）。
+
 **`Stop` 的关闭超时契约**：`Stop` 必须以传入的 `ctx` 控制关闭的最长等待时间。引擎先取消内部
 context 以通知所有 Worker，再等待 Worker 退出；若业务 `fn` 忽略传入的 context 而持续阻塞，
 `Stop` 在 `ctx` 到期时返回其错误，而非无限等待。无论是否超时，活跃的唤醒定时器都必须被取消。
@@ -421,8 +428,20 @@ func (wf *WorkflowContext) Return(result any, opts ...Option) error
     - 捕获 `ErrSleeping` -> 标记 `StatusAwaiting`，以 `sleepDeadline` 注册唤醒定时器。
     - 捕获 `ErrAwaiting` -> 标记 `StatusAwaiting`，以 `awaitDeadline` 注册超时定时器（零值表示不注册
       定时器，仅等待外部 `Signal`）。
+    - 引擎关闭中断（内部 ctx 已取消且业务返回非哨兵错误）-> **保持 `Running`**，不判定失败，
+      交由重启后 `Recover` 按 journal 幂等重放恢复（见下文「优雅关停的可恢复性」）。
     - 其他错误 -> 标记失败。
 7. **状态持久化**与**释放锁**（`Locker.Release`）。
+
+**优雅关停的可恢复性（契约）**：`Stop` 取消引擎内部 ctx 后，正在执行中（尚未挂起或完成）的
+工作流会因 ctx 取消而中断——`Execute` 在重试循环入口感知到 `ctx.Err()` 即返回、不再白跑业务函数。
+此时 run 循环**不得**把该中断判定为业务失败（`StatusFailed`），而应**保持 `Running`**：与进程崩溃
+语义一致（崩溃时状态亦停留在 run 循环第 6 步标记的 `Running`），重启后 `Recover` 重新调度、按
+journal 幂等重放即可恢复。若误判 `Failed`，则因终态被 `Recover` 跳过而永久丢失——优雅关停将比
+崩溃更致命。已落盘的 journal 步骤在重放时命中跳过，被中断的那一步会被重新执行，故真正的业务
+错误（若存在）会在重启后引擎正常运行时再次暴露并判 `Failed`。判定条件为 `ctx.Err() != nil`：
+仅当引擎自身的 ctx 已取消时才适用，业务函数在引擎正常运行期间返回的任何错误仍走「其他错误 ->
+标记失败」。
 
 **唤醒时刻的选取（契约）**：调度唤醒时，必须依据**返回的哨兵错误**选取对应的截止时刻
 （`ErrSleeping`→`sleepDeadline`、`ErrAwaiting`→`awaitDeadline`），**不得**取两者中任意非零值。
@@ -536,7 +555,9 @@ type Cloner interface {
 ├── policy/                  # 策略包
 │   └── retry.go             # RetryPolicy 接口与基础实现 (对应第 10 节)
 ├── examples/                # 使用示例
-│   └── hello_workflow.go    # 演示如何定义和运行工作流
+│   ├── hello_workflow.go    # 演示如何定义和运行工作流（Input→Execute→Sleep→Await→Return）
+│   └── replay/              # 确定性重放端到端演示（首次录制 → 模拟崩溃 → 重放一致性校验）
+│       └── main.go
 └── go.mod
 ```
 

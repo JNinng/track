@@ -116,6 +116,14 @@ func (e *Engine) run(ctx context.Context, runID model.RunID) {
 			return
 		}
 		e.scheduleWakeup(runID, wf.awaitDeadline)
+	case ctx.Err() != nil:
+		// 引擎正在关闭（内部 ctx 已取消）导致业务函数被中断：不判定为业务失败。
+		// 保持 Running 状态，交由重启后 Recover 按 journal 幂等重放——与进程崩溃
+		// 语义一致（崩溃时状态亦停留在 Running），避免优雅关停反而比崩溃更致命
+		// （Failed 为终态，Recover 跳过，造成在途工作流永久丢失）。
+		// 已落盘的 journal 步骤在重放时命中跳过，未执行的那一步会被重新执行，
+		// 故真正的业务错误（若存在）会在重启后正常运行时再次暴露并判 Failed。
+		log.Printf("engine: run %s interrupted by shutdown, left Running for recovery", runID)
 	default:
 		// 业务返回普通 error 或原语返回 ErrJournalMismatch 等：标记失败。
 		// 若是 divergence（如 ErrJournalMismatch），其本身即错误信息。

@@ -209,3 +209,122 @@ func TestStopConcurrentDispatchNoPanic(t *testing.T) {
 		wg.Wait()
 	}
 }
+
+// 优雅关停（内部 ctx 取消）期间被中断的工作流不得被标记为 Failed。
+//
+// 回归：executeWithPolicy 在引擎 ctx 取消时返回 context.Canceled，runner 的 default
+// 分支据此调用 fail() 判定 StatusFailed——而 Failed 是终态，Recover 跳过，造成在途
+// 工作流永久丢失。这与进程崩溃的语义不对称：崩溃时状态停留在 Running（run 循环第 6
+// 步），重启后 Recover 按 journal 幂等重放即可恢复。优雅关停不应比崩溃更致命。
+//
+// 修复后：当 run 的 ctx 已取消（引擎关停）且业务返回非哨兵错误时，runner 保持 Running，
+// 交由重启后 Recover 重新调度。已提交的 journal 步骤在重放时命中、跳过实际副作用，
+// 故不会重复执行被中断的那一步。
+func TestShutdownInterruptedWorkflowStaysRunning(t *testing.T) {
+	s := memory.New()
+	e := NewEngine(s, WithWorkers(1))
+	e.testOpts.noAutoRecover = true
+
+	gate := make(chan struct{})
+	var entered int32
+	e.Register("w", func(wf *WorkflowContext) error {
+		// 第一步：成功提交（落入 journal）。
+		if _, err := Execute(wf, func(ctx context.Context) (int, error) {
+			return 1, nil
+		}); err != nil {
+			return err
+		}
+		atomic.StoreInt32(&entered, 1)
+		<-gate // 阻塞，模拟业务仍在执行。
+		// 第二步：引擎 ctx 已取消，executeWithPolicy 感知到并返回 ctx 错误。
+		_, err := Execute(wf, func(ctx context.Context) (int, error) {
+			return 2, nil
+		})
+		return err
+	})
+
+	rid, _ := e.Start(context.Background(), "w", nil)
+	// 等待第一步提交、业务阻塞在 gate。
+	if !waitForCond(time.Second, func() bool { return atomic.LoadInt32(&entered) == 1 }) {
+		t.Fatal("workflow did not reach gate")
+	}
+
+	// 取消引擎内部 ctx，模拟 Stop 的第一步（e.cancel）。
+	e.cancel()
+	// 放行：第二步 Execute 将因 ctx 取消返回错误。
+	close(gate)
+	// 以锁释放为 run 完成信号（run 的 defer 释放锁）。
+	if !waitForCond(time.Second, func() bool { return !s.IsLocked(rid) }) {
+		t.Fatal("run did not complete (lock not released)")
+	}
+
+	m, _ := e.GetResult(context.Background(), rid)
+	if m.Status != model.StatusRunning {
+		t.Fatalf("status=%s err=%q, want Running (shutdown-interrupted workflow must stay recoverable, not Failed)",
+			m.Status, m.Err)
+	}
+}
+
+// 被关停中断后保留 Running 的实例，重启后由 Recover 按 journal 幂等重放，
+// 完成未执行的那一步——证明"保持 Running"是可恢复的，而非永久滞留。
+func TestShutdownInterruptedWorkflowRecoversOnRestart(t *testing.T) {
+	s := memory.New()
+	e := NewEngine(s, WithWorkers(1))
+	e.testOpts.noAutoRecover = true
+
+	gate := make(chan struct{})
+	var entered int32
+	e.Register("w", func(wf *WorkflowContext) error {
+		if _, err := Execute(wf, func(ctx context.Context) (int, error) {
+			return 1, nil
+		}); err != nil {
+			return err
+		}
+		atomic.StoreInt32(&entered, 1)
+		<-gate
+		_, err := Execute(wf, func(ctx context.Context) (int, error) {
+			return 2, nil
+		})
+		if err != nil {
+			return err
+		}
+		return wf.Return("done")
+	})
+
+	rid, _ := e.Start(context.Background(), "w", nil)
+	if !waitForCond(time.Second, func() bool { return atomic.LoadInt32(&entered) == 1 }) {
+		t.Fatal("workflow did not reach gate")
+	}
+	e.cancel()
+	close(gate)
+	if !waitForCond(time.Second, func() bool { return !s.IsLocked(rid) }) {
+		t.Fatal("run did not complete")
+	}
+	if m, _ := e.GetResult(context.Background(), rid); m.Status != model.StatusRunning {
+		t.Fatalf("precondition: status=%s, want Running after shutdown interrupt", m.Status)
+	}
+
+	// "重启"：新引擎共享同一存储，手动 Recover 触发重放。重放时第一步命中 journal
+	// 跳过，第二步重新执行并提交，最终 Return 完成——证明"保持 Running"是可恢复的。
+	e2 := NewEngine(s, WithWorkers(1))
+	e2.testOpts.noAutoRecover = true
+	e2.Register("w", func(wf *WorkflowContext) error {
+		if _, err := Execute(wf, func(ctx context.Context) (int, error) {
+			return 1, nil
+		}); err != nil {
+			return err
+		}
+		if _, err := Execute(wf, func(ctx context.Context) (int, error) {
+			return 2, nil
+		}); err != nil {
+			return err
+		}
+		return wf.Return("done")
+	})
+	e2.Recover(context.Background())
+
+	m := awaitStatus(t, e2, rid, time.Second)
+	if m.Status != model.StatusSucceeded {
+		t.Fatalf("status=%s err=%q, want Succeeded after recover-replay", m.Status, m.Err)
+	}
+}

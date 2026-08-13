@@ -148,12 +148,15 @@ run(ctx, runID)
    ┌──────────┐   唤醒定时器 / 外部 Signal ── dispatch ──►  回到 Running
    │ Awaiting │
    └────┬─────┘
-        │ 其它错误 / 版本不符 / 工作流未注册 / 日志发散
+        │ 其它错误（ctx 未取消）/ 版本不符 / 工作流未注册 / 日志发散
         ▼
    ┌────────┐
    │ Failed │ 终态
    └────────┘
    （Cancelled 已定义，但触发 API 不在当前契约范围内）
+
+   注：Stop 取消内部 ctx 时，执行中被中断的工作流（非哨兵错误 + ctx.Err()!=nil）
+       保持 Running——不转入 Failed，交由重启 Recover 重放恢复（见下表）。
 ```
 
 终态判定：`StatusSucceeded / StatusFailed / StatusCancelled` 为终态（`IsTerminal`）。`StatusRunning`/`StatusAwaiting` 非终态，可继续变化。
@@ -166,7 +169,14 @@ run(ctx, runID)
 | `ErrReturn` | drift 守卫 → `succeed(returnData)` | Succeeded（输出=落盘 KindReturn payload） |
 | `ErrSleeping` | `StatusAwaiting` + `scheduleWakeup(sleepDeadline)` | 非终态 |
 | `ErrAwaiting` | `StatusAwaiting` + `scheduleWakeup(awaitDeadline)` | 非终态 |
-| 其它 | `fail(msg)` | Failed |
+| 非哨兵错误 + `ctx.Err()!=nil` | **保持 Running**（不判失败），交由重启 Recover 重放 | 非终态 |
+| 其它（非哨兵错误） | `fail(msg)` | Failed |
+
+> **优雅关停不判失败**：`Stop` 取消内部 ctx 后，执行中的工作流被中断（`Execute` 在重试入口感知
+> `ctx.Err()` 即返回）。run 循环检测到 `ctx.Err()!=nil` 时保持 `Running` 而非 `fail()`——与进程崩溃
+> 语义一致（崩溃亦停留在 `Running`），重启后 `Recover` 按 journal 幂等重放恢复。若误判 `Failed`，
+> 终态被 `Recover` 跳过，在途工作流将永久丢失（优雅关停反而比崩溃更致命）。真正的业务错误会在
+> 重启后引擎正常运行时再次暴露并判 `Failed`。
 
 ## 7. 日志驱动与确定性重放
 
@@ -327,6 +337,8 @@ loop:
 
 - **失败不写日志**：重试耗尽的失败步骤不 `commit`，恢复时重新执行，维持确定性。
 - **重试状态隔离**：状态化策略（FixedDelay/ExponentialBackoff）实现 `Cloner`，每次 Execute 克隆独立副本，避免跨调用/跨实例共享计数（`policy/retry.go:145`）。
+- **引擎关停不判失败**：入口的 `ctx.Err()` 检查令 Execute 在引擎关停时立即返回 ctx 错误而不白跑
+  fn；run 循环据此（`ctx.Err()!=nil`）保持 `Running` 而非判 `Failed`（见 §6），交由重启 Recover 重放。
 
 ## 11. 测试钩子
 
