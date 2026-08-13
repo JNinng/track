@@ -76,17 +76,19 @@ func WithQueueSize(n int) EngineOption {
 	}
 }
 
-// 用于在测试中避免 Recover 自动触发导致的噪声。
+// WithRecoverInterval 设置周期性后台 Recover 扫描的间隔。
+//
+// 周期扫描作为持久化兜底：重新推入因进程崩溃遗留、或队列满被丢弃（状态保持）
+// 的实例。d > 0 启用，d <= 0 禁用；缺省 30s。
+func WithRecoverInterval(d time.Duration) EngineOption {
+	return func(e *Engine) {
+		e.recoverInterval = d
+	}
+}
+
+// testOptions 暴露包内测试开关：包内测试直接设置 Engine.testOpts 字段，
+// 由已导出的 TestOptions / SetTestOptions（见 testing.go）封装。
 type testOptions struct {
 	noAutoRecover bool
 	runSync       bool // Start/run 直接同步执行（不经调度器），便于确定性测试
 }
-
-// testOption 仅供包内测试使用。
-type testOption func(*testOptions)
-
-// withNoAutoRecover 禁用 Start 首次调用时的自动 Recover 扫描。
-func withNoAutoRecover(o *testOptions) { o.noAutoRecover = true }
-
-// withRunSync 让引擎以同步方式执行任务（不经 Worker Pool）。
-func withRunSync(o *testOptions) { o.runSync = true }

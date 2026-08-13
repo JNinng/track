@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"time"
 
 	"github.com/jninng/track/clock"
@@ -232,10 +233,9 @@ func (wf *WorkflowContext) Sleep(d time.Duration, opts ...Option) error {
 //  1. 若 timeout > 0：消费/记录超时截止时刻（KindAwaitDeadline）。
 //  2. 消费已决策的结果：KindAwaitTimeout 复现超时分支；KindAwait 返回历史载荷。
 //     这一步是确定性的关键：重放不依赖信箱当前态，迟到信号无法改变结果。
-//  3. 若尚未决策且已超时、信箱确无信号：持久化超时决策并返回 ErrAwaitTimeout。
-//  4. 检查 Mailbox 是否已有信号（Fetch）。
-//  5. 若有：记录消费日志、Ack 删除信号、返回数据。
-//  6. 若无：设置 awaitDeadline，返回 ErrAwaiting。
+//  3. 若尚未决策：单次 Fetch 信号——命中则记录消费、Ack、返回。
+//  4. 信箱确无信号时，若已超时：持久化超时决策并返回 ErrAwaitTimeout。
+//  5. 否则设置 awaitDeadline，返回 ErrAwaiting。
 //
 // 可选 WithLabel 为条目附加人类可读标签（不影响重放匹配）。
 func (wf *WorkflowContext) Await(signal model.Signal, timeout time.Duration, opts ...Option) ([]byte, error) {
@@ -282,25 +282,18 @@ func (wf *WorkflowContext) Await(signal model.Signal, timeout time.Duration, opt
 		return oe.Payload, nil
 	}
 
-	// 3. 尚未决策：若已超时且信箱确无信号，持久化超时决策。
-	if timeout > 0 && !wf.clock.Now().Before(wf.awaitDeadline) {
-		if _, ferr := wf.mailbox.Fetch(wf.ctx, wf.runID, signal); errors.Is(ferr, store.ErrNotFound) {
-			if err := wf.commit(model.KindAwaitTimeout, cfg.Label, nil); err != nil {
-				return nil, err
-			}
-			return nil, ErrAwaitTimeout
-		}
-	}
-
-	// 4. 尝试从信箱获取信号。
+	// 3. 尚未决策：单次 Fetch 信号（命中即消费，避免对计费/远程后端双倍读）。
 	payload, ferr := wf.mailbox.Fetch(wf.ctx, wf.runID, signal)
 	if ferr == nil {
-		// 5. 已到达：记录消费、Ack、返回。
+		// 命中：记录消费日志、Ack 删除信号、返回数据。
 		if err := wf.commit(model.KindAwait, cfg.Label, payload); err != nil {
 			return nil, err
 		}
+		// 决策已落盘（KindAwait），日志是确定性的真相：Ack 失败只留下孤儿信号，
+		// 不影响重放确定性（重放时 KindAwait 命中即返回，不再触达 Fetch/Ack），
+		// 故仅记日志、不判定工作流失败。
 		if err := wf.mailbox.Ack(wf.ctx, wf.runID, signal); err != nil {
-			return nil, err
+			log.Printf("engine: ack signal %s for %s failed: %v (decision already committed)", signal, wf.runID, err)
 		}
 		return payload, nil
 	}
@@ -308,7 +301,15 @@ func (wf *WorkflowContext) Await(signal model.Signal, timeout time.Duration, opt
 		return nil, ferr
 	}
 
-	// 6. 未到达：挂起。
+	// 4. 信箱确无信号：若已超时，持久化超时决策并返回。
+	if timeout > 0 && !wf.clock.Now().Before(wf.awaitDeadline) {
+		if err := wf.commit(model.KindAwaitTimeout, cfg.Label, nil); err != nil {
+			return nil, err
+		}
+		return nil, ErrAwaitTimeout
+	}
+
+	// 5. 未到达：挂起，等待外部 Signal 或超时唤醒。
 	return nil, ErrAwaiting
 }
 

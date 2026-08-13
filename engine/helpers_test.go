@@ -4,11 +4,13 @@ import (
 	"context"
 	"encoding/json"
 	"strconv"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/jninng/track/infra/memory"
 	"github.com/jninng/track/model"
+	"github.com/jninng/track/store"
 )
 
 // jsonUnmarshal 是 encoding/json.Unmarshal 的简短别名，便于测试阅读。
@@ -57,4 +59,30 @@ func logsEqual(a, b []model.LogEntry) bool {
 func waitFor(t *testing.T, e *Engine, runID model.RunID, d time.Duration) *model.RunMeta {
 	t.Helper()
 	return awaitStatus(t, e, runID, d)
+}
+
+// fetchCountingStore 包装一个 store.Interface，统计 Fetch 调用次数，用于验证
+// Await 原语不会对同一信号重复 Fetch。
+type fetchCountingStore struct {
+	store.Interface
+	fetches int32
+}
+
+func (f *fetchCountingStore) Fetch(ctx context.Context, runID model.RunID, signal model.Signal) ([]byte, error) {
+	atomic.AddInt32(&f.fetches, 1)
+	return f.Interface.Fetch(ctx, runID, signal)
+}
+
+// ackFailingStore 包装一个 store.Interface，其 Ack 恒定返回指定错误，用于验证
+// Ack 失败不会被判定为工作流失败（决策已落盘，日志为确定性真相）。
+type ackFailingStore struct {
+	store.Interface
+	ackErr error
+}
+
+func (a *ackFailingStore) Ack(ctx context.Context, runID model.RunID, signal model.Signal) error {
+	if a.ackErr != nil {
+		return a.ackErr
+	}
+	return a.Interface.Ack(ctx, runID, signal)
 }

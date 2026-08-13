@@ -112,21 +112,36 @@ func (s *scheduler) scheduleWakeup(runID model.RunID, deadline time.Time) {
 	}()
 }
 
-// stop 关闭队列并等待所有 Worker 退出。
+// stop 关闭队列并等待所有 Worker 退出，至多等待至 ctx 到期。
 //
 // close(s.queue) 在 stopMu 临界区内执行，与 enqueue 的发送互斥，
 // 避免向已关闭 channel 发送的 panic。
-func (s *scheduler) stop() {
+//
+// 若业务 fn 忽略传入的 context 而持续阻塞，Worker 无法退出；此时 Stop 不应
+// 无限等待。done 在所有 Worker 退出后关闭，ctx.Done() 先到期则返回其错误
+// （仍在执行的 Worker 由调用方自行处置）。无论结果如何，活跃定时器都会被取消。
+func (s *scheduler) stop(ctx context.Context) error {
 	s.stopMu.Lock()
 	if s.stopped {
 		s.stopMu.Unlock()
-		return
+		return nil
 	}
 	s.stopped = true
 	close(s.queue)
 	s.stopMu.Unlock()
 
-	s.wg.Wait()
+	done := make(chan struct{})
+	go func() {
+		s.wg.Wait()
+		close(done)
+	}()
+
+	var err error
+	select {
+	case <-done:
+	case <-ctx.Done():
+		err = ctx.Err()
+	}
 
 	s.timersMu.Lock()
 	for _, cancel := range s.timers {
@@ -134,6 +149,8 @@ func (s *scheduler) stop() {
 	}
 	s.timers = make(map[model.RunID]context.CancelFunc)
 	s.timersMu.Unlock()
+
+	return err
 }
 
 // clearTimer 从活跃定时器表中移除并取消某实例的定时器。

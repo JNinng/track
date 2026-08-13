@@ -26,6 +26,9 @@ type Engine struct {
 	workers   int
 	queueSize int
 
+	// recoverInterval 是周期性后台 Recover 扫描的间隔；<=0 表示禁用。
+	recoverInterval time.Duration
+
 	mu     sync.RWMutex
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -39,18 +42,22 @@ type Engine struct {
 func NewEngine(s store.Interface, opts ...EngineOption) *Engine {
 	ctx, cancel := context.WithCancel(context.Background())
 	e := &Engine{
-		store:    s,
-		registry: make(map[string]*registeredWorkflow),
-		clock:    clock.RealClock{},
-		workers:  defaultWorkers,
-		ctx:      ctx,
-		cancel:   cancel,
+		store:           s,
+		registry:        make(map[string]*registeredWorkflow),
+		clock:           clock.RealClock{},
+		workers:         defaultWorkers,
+		recoverInterval: 30 * time.Second,
+		ctx:             ctx,
+		cancel:          cancel,
 	}
 	for _, o := range opts {
 		o(e)
 	}
 	e.sched = newScheduler(e, e.workers, e.queueSize)
 	e.sched.start()
+	if e.recoverInterval > 0 {
+		go e.recoverLoop()
+	}
 	return e
 }
 
@@ -138,10 +145,13 @@ func (e *Engine) GetResult(ctx context.Context, runID model.RunID) (*model.RunMe
 }
 
 // Stop 优雅关闭引擎，等待 Worker 停止与活跃定时器取消。
+//
+// ctx 控制关闭的最长等待时间：若业务 fn 忽略传入的 context 而持续阻塞，
+// Stop 会在 ctx 到期时返回其错误，而非无限等待。无论是否超时，活跃的唤醒
+// 定时器都会被取消。
 func (e *Engine) Stop(ctx context.Context) error {
 	e.cancel()
-	e.sched.stop()
-	return nil
+	return e.sched.stop(ctx)
 }
 
 // Recover 扫描存储中处于 Running/Awaiting 的实例，重新推入队列恢复执行
@@ -155,6 +165,28 @@ func (e *Engine) Recover(ctx context.Context) error {
 		e.dispatch(m.RunID)
 	}
 	return nil
+}
+
+// recoverLoop 周期性扫描存储，恢复因崩溃遗留或队列满被丢弃而滞留的实例。
+//
+// 作为持久化兜底：被丢弃的任务保持 Running/Awaiting 状态，会在下一次扫描时
+// 被重新推入队列。间隔由 WithRecoverInterval 配置；引擎关闭（ctx 取消）时退出。
+func (e *Engine) recoverLoop() {
+	ticker := time.NewTicker(e.recoverInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-e.ctx.Done():
+			return
+		case <-ticker.C:
+			if err := e.Recover(e.ctx); err != nil {
+				if e.ctx.Err() != nil {
+					return // 关闭中：静默退出。
+				}
+				log.Printf("engine: periodic recover failed: %v", err)
+			}
+		}
+	}
 }
 
 // dispatch 将 RunID 投递给执行路径：同步模式下直接 run，否则进入调度器队列。

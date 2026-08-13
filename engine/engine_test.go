@@ -360,3 +360,60 @@ func TestSignalTerminalInstanceIsNoop(t *testing.T) {
 		t.Fatal("terminal signal should not persist")
 	}
 }
+
+// 周期性后台 Recover 作为持久化兜底：扫描存储中处于 Running/Awaiting 的实例，
+// 重新推入队列恢复执行。覆盖进程崩溃幸存者，以及队列满时被丢弃但状态保持的任务。
+func TestPeriodicRecoverRescuesStuckInstance(t *testing.T) {
+	s := memory.New()
+	e := NewEngine(s, WithWorkers(2), WithRecoverInterval(15*time.Millisecond))
+	e.testOpts.noAutoRecover = true // 禁用一次性自动扫描，隔离周期路径。
+	defer e.Stop(context.Background())
+
+	var done int32
+	e.Register("w", func(wf *WorkflowContext) error {
+		atomic.AddInt32(&done, 1)
+		return wf.Return("ok")
+	})
+
+	// 植入一个"崩溃幸存者"：处于 Running 但不在队列中。
+	rid := model.RunID("run-stuck")
+	if err := s.UpdateStatus(context.Background(), rid, model.StatusRunning,
+		store.WithName("w"), store.WithVersion(defaultVersion("w"))); err != nil {
+		t.Fatal(err)
+	}
+
+	// 周期扫描应在 ~15ms 内发现并恢复执行。
+	m := awaitStatus(t, e, rid, 2*time.Second)
+	if m.Status != model.StatusSucceeded {
+		t.Fatalf("status=%s err=%s, want Succeeded (periodic recover failed to rescue)", m.Status, m.Err)
+	}
+	if got := atomic.LoadInt32(&done); got != 1 {
+		t.Fatalf("workflow body ran %d time(s), want 1", got)
+	}
+}
+
+// WithRecoverInterval(0) 必须禁用周期扫描：禁用后滞留实例不会被自动恢复。
+func TestPeriodicRecoverDisabledByZeroInterval(t *testing.T) {
+	s := memory.New()
+	e := NewEngine(s, WithWorkers(2), WithRecoverInterval(0))
+	e.testOpts.noAutoRecover = true
+	defer e.Stop(context.Background())
+
+	e.Register("w", func(wf *WorkflowContext) error { return wf.Return("ok") })
+
+	rid := model.RunID("run-stuck-disabled")
+	if err := s.UpdateStatus(context.Background(), rid, model.StatusRunning,
+		store.WithName("w"), store.WithVersion(defaultVersion("w"))); err != nil {
+		t.Fatal(err)
+	}
+
+	// 给可能的扫描充足窗口；禁用后状态应保持 Running。
+	time.Sleep(50 * time.Millisecond)
+	m, err := e.GetResult(context.Background(), rid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if m.Status != model.StatusRunning {
+		t.Fatalf("status=%s, want Running (periodic recover should be disabled)", m.Status)
+	}
+}

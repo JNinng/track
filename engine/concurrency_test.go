@@ -2,6 +2,7 @@ package engine
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -140,6 +141,44 @@ func waitForCond(d time.Duration, cond func() bool) bool {
 		time.Sleep(time.Millisecond)
 	}
 	return cond()
+}
+
+// Stop 必须以传入的 ctx 控制关闭超时：当业务 fn 忽略 context 仍阻塞时，
+// Stop(ctx) 应在 ctx 到期时返回其错误，而非无限等待 worker 退出。
+func TestStopRespectsContextDeadline(t *testing.T) {
+	s := memory.New()
+	e := NewEngine(s, WithWorkers(1))
+	e.testOpts.noAutoRecover = true
+
+	var entered int32
+	release := make(chan struct{})
+	e.Register("w", func(wf *WorkflowContext) error {
+		atomic.StoreInt32(&entered, 1)
+		<-release // 故意忽略 context，模拟不可中断的业务逻辑。
+		return wf.Return("ok")
+	})
+
+	rid, _ := e.Start(context.Background(), "w", nil)
+	if !waitForCond(time.Second, func() bool { return atomic.LoadInt32(&entered) == 1 }) {
+		t.Fatal("workflow did not enter body")
+	}
+
+	// ctx 远短于 worker 阻塞时长；Stop 必须据此提前返回。
+	ctx, cancel := context.WithTimeout(context.Background(), 40*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	err := e.Stop(ctx)
+	elapsed := time.Since(start)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Stop err=%v, want DeadlineExceeded (elapsed=%v)", err, elapsed)
+	}
+	if elapsed > 500*time.Millisecond {
+		t.Fatalf("Stop did not respect ctx deadline: elapsed=%v", elapsed)
+	}
+
+	// 放行被阻塞的 worker，避免 goroutine 泄漏。
+	close(release)
+	_ = rid
 }
 
 // Stop 与并发 Start/唤醒定时器之间不应触发 "send on closed channel" panic。

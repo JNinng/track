@@ -320,6 +320,84 @@ func TestAwaitTimeoutDecisionPersists(t *testing.T) {
 	}
 }
 
+// Await 在“超时时刻已到且信箱已有信号”的场景下，对 Mailbox.Fetch 只应调用一次。
+// 回归：修复前超时判定与取值各 Fetch 一次，对远程/计费后端是双倍读。
+func TestAwaitSingleFetchWhenDeadlineReachedWithSignal(t *testing.T) {
+	clk := clock.NewFakeClock()
+	s := &fetchCountingStore{Interface: memory.New()}
+	e := NewEngine(s, WithClock(clk))
+	e.testOpts.runSync = true
+	e.testOpts.noAutoRecover = true
+
+	e.Register("w", func(wf *WorkflowContext) error {
+		payload, err := wf.Await("ready", 5*time.Second)
+		if err != nil {
+			return err
+		}
+		return wf.Return(string(payload))
+	})
+
+	rid, _ := e.Start(context.Background(), "w", nil)
+	// 首次运行记录 deadline 后挂起。
+	if m, _ := e.GetResult(context.Background(), rid); m.Status != model.StatusAwaiting {
+		t.Fatalf("want Awaiting, got %s", m.Status)
+	}
+	// 仅统计消费过程的 Fetch。
+	atomic.StoreInt32(&s.fetches, 0)
+
+	// 推进超过 deadline，再投递信号：此时 deadline 已到且信号已到。
+	clk.Advance(6 * time.Second)
+	if err := e.Signal(context.Background(), rid, "ready", "hi"); err != nil {
+		t.Fatal(err)
+	}
+
+	m := awaitStatus(t, e, rid, time.Second)
+	if m.Status != model.StatusSucceeded {
+		t.Fatalf("status=%s err=%s", m.Status, m.Err)
+	}
+	if got := atomic.LoadInt32(&s.fetches); got != 1 {
+		t.Fatalf("Fetch called %d time(s), want 1 (single fetch on consume)", got)
+	}
+}
+
+// Await 成功消费信号后 Mailbox.Ack 失败不得判定工作流失败：
+// KindAwait 决策已落盘，重放时命中即返回，Ack 失败只留下孤儿信号。
+func TestAwaitAckFailureIsNotFatal(t *testing.T) {
+	clk := clock.NewFakeClock()
+	s := &ackFailingStore{Interface: memory.New(), ackErr: errors.New("simulated ack failure")}
+	e := NewEngine(s, WithClock(clk))
+	e.testOpts.runSync = true
+	e.testOpts.noAutoRecover = true
+
+	e.Register("w", func(wf *WorkflowContext) error {
+		payload, err := wf.Await("ready", 0)
+		if err != nil {
+			return err
+		}
+		var msg string
+		if err := jsonUnmarshal(payload, &msg); err != nil {
+			return err
+		}
+		return wf.Return(msg)
+	})
+
+	rid, _ := e.Start(context.Background(), "w", nil)
+	if err := e.Signal(context.Background(), rid, "ready", "hi"); err != nil {
+		t.Fatal(err)
+	}
+	m := awaitStatus(t, e, rid, time.Second)
+	if m.Status != model.StatusSucceeded {
+		t.Fatalf("status=%s err=%s, want Succeeded (Ack failure must not be fatal)", m.Status, m.Err)
+	}
+	var got string
+	if err := jsonUnmarshal(m.Output, &got); err != nil {
+		t.Fatal(err)
+	}
+	if got != "hi" {
+		t.Fatalf("output=%q want hi", got)
+	}
+}
+
 // ---- Return 原语（设计文档 6.5）----
 
 func TestReturnPrimitive(t *testing.T) {
