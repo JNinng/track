@@ -67,18 +67,21 @@ func (f *FakeClock) Now() time.Time {
 // After 注册一个定时器，并返回一个通道。
 //
 // 通道在 Advance 推进到或超过 d 之后会被发送当时的模拟时间。
-// 若 d <= 0，通道在下次 Advance（或立即，见实现）时触发。
+// 若 d <= 0，通道在注册时立即触发。
 func (f *FakeClock) After(d time.Duration) <-chan time.Time {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	ch := make(chan time.Time, 1)
 	deadline := f.now.Add(d)
 	t := &fakeTimer{deadline: deadline, ch: ch}
-	f.timers = append(f.timers, t)
-	// 已到期则立即触发。
+	// 已到期（d<=0）则立即触发，且不计入 timers：否则 HasPendingTimers 会误报
+	// （已触发的定时器不应算 pending），且 Advance 的过滤条件无法清除它，
+	// 多次调用将导致 timers 切片无界增长。
 	if !deadline.After(f.now) {
 		t.fired = true
 		ch <- f.now
+	} else {
+		f.timers = append(f.timers, t)
 	}
 	return ch
 }

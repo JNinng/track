@@ -73,3 +73,21 @@ func TestFakeClockAfterZeroFiresImmediately(t *testing.T) {
 		t.Fatal("zero-duration timer should fire on registration")
 	}
 }
+
+// 立即触发（d<=0）的定时器不得残留在内部 timers 列表中：
+// 否则 HasPendingTimers 误报 true（语义上定时器已触发、不再 pending），
+// 且 Advance 永远无法清除它，多次调用将导致切片无界增长。
+func TestFakeClockAfterZeroDoesNotLeak(t *testing.T) {
+	c := NewFakeClock()
+	c.After(0)
+	c.After(-1) // 负值同样立即触发
+
+	if c.HasPendingTimers() {
+		t.Fatal("HasPendingTimers=true after After(0)/After(-1); already-fired timers must not be pending")
+	}
+	// Advance 也不应把它当作待触发条目残留。
+	c.Advance(5 * time.Second)
+	if c.HasPendingTimers() {
+		t.Fatal("already-fired zero-duration timer leaked across Advance")
+	}
+}
