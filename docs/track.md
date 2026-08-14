@@ -55,7 +55,7 @@ type LogEntry struct {
     Kind    EntryKind // 功能类别，重放匹配与发散检测的身份键
     Label   string    // 可选人类可读标签；纯元数据，绝不参与重放匹配
     Payload []byte    // 序列化的执行结果 (JSON)
-    Err     string    // 错误标记，空表示成功
+    Err     string    // 保留字段：当前恒为空（Execute 只记录成功，见 6.2），仅为向前兼容保留
 }
 ```
 
@@ -172,6 +172,9 @@ type Locker interface {
 提供 `NewLockerWithLease(d)` 自定义；测试用钩子：`IsLocked(runID)` 观测持有状态、`Expire(runID)`
 强制过期以模拟崩溃、`SetNow(fn)` 注入可控时钟。
 
+**租约约束（运维契约）**：引擎**不做租约续期**。调用方必须保证单个 run 的同步执行总时长小于
+租约时长（必要时用 `WithLease` 调大），否则租约中途过期会导致其它 Worker 接管、并发执行同一实例。
+
 ### 4.4 Meta (元数据)
 
 管理顶层实例状态。
@@ -220,6 +223,7 @@ type WorkflowFunc func(wf *WorkflowContext) error
 func (e *Engine) Register(name string, fn WorkflowFunc, opts ...RegisterOption) error
 // Start 启动一个新的工作流实例：持久化元数据并将 RunID 推入队列后立即返回；
 // 实际执行由 Worker 异步完成。返回 runID 或 error。
+// 首次 Start 会自动触发一次 Recover 扫描（排除本次刚创建的实例，避免双投递）。
 func (e *Engine) Start(ctx context.Context, name string, input any) (RunID, error)
 // Signal 向挂起的实例发送信号，触发恢复。signal 为信号标识。
 func (e *Engine) Signal(ctx context.Context, runID RunID, signal Signal, payload any) error
@@ -419,7 +423,9 @@ func (wf *WorkflowContext) Return(result any, opts ...Option) error
 2. **读取元数据**：跳过终态实例。
 3. **查找工作流**：按 `RunMeta.Name` 查找已注册函数；未注册则标记失败（`ErrWorkflowNotFound`）。
 4. **版本校验**：对比 `RunMeta.Version` 与当前注册的代码版本，不一致则拒绝重放，返回
-   `ErrVersionMismatch` 以防止破坏确定性。
+   `ErrVersionMismatch` 以防止破坏确定性。比较为**严格比较**：`RunMeta.Version` 缺失（空串）
+   同样视为不一致——引擎自身的 `Start` 恒写入版本号，空版本仅可能来自存储外部写入，
+   拒绝重放以防未经版本保护的实例静默重放。
 5. **加载历史**：从存储读取所有 LogEntry（按追加顺序）作为 `journal` 工作副本；`cursor` 置 0，
    `isReplay = len(logs) > 0`（run 开始时一次性锚定）。
 6. **标记运行中**并执行业务函数，按返回的哨兵错误转换状态：
@@ -430,6 +436,12 @@ func (wf *WorkflowContext) Return(result any, opts ...Option) error
       定时器，仅等待外部 `Signal`）。
     - 引擎关闭中断（内部 ctx 已取消且业务返回非哨兵错误）-> **保持 `Running`**，不判定失败，
       交由重启后 `Recover` 按 journal 幂等重放恢复（见下文「优雅关停的可恢复性」）。
+    - 存储瞬时故障（journal `Append` 失败、信箱 `Fetch` 非 NotFound 失败等）-> **保持 `Running`**，
+      不判定失败。存储读写失败是基础设施故障而非业务失败：若判终态 `Failed`，一次网络抖动即可
+      永久杀死长时工作流。失败的 `Append` 意味着条目未写入，重试幂等安全（重放不会重复），故由
+      `Recover` 兜底重试即可收敛——与优雅关停中断的处理同构。
+    - 业务函数 **panic** -> 捕获并转换为该实例的 `StatusFailed`（错误信息含 panic 值），Worker
+      goroutine 存活。panic 若不捕获会沿 Worker 冒泡导致整个进程崩溃，远比单实例失败严重。
     - 其他错误 -> 标记失败。
 7. **状态持久化**与**释放锁**（`Locker.Release`）。
 
@@ -480,6 +492,8 @@ type Clock interface {
 ```
 
 引擎默认注入 `RealClock`；测试环境替换为 `FakeClock` 手动推进时间（`Advance(d)`）。
+`FakeClock` 另提供构造与观测辅助：`NewFakeClockAt(t)` 指定初始时刻、`HasPendingTimers()`
+断言是否存在尚未触发的定时器（用于验证唤醒注册/清理是否泄漏）。
 
 ## 10. 错误处理与重试
 
@@ -570,7 +584,7 @@ type Cloner interface {
 所有涉及工作流逻辑的测试，必须基于 **"Record & Replay" (录制与重放)** 模式进行，禁止仅使用简单的 Happy Path 单元测试。
 
 * **约束规则**：每个 `WorkflowFunc` 必须拥有对应的集成测试，验证：**给定相同的输入与历史日志，执行结果必须完全一致。**
-* **强制手段**：测试框架应提供 `ReplayTester` 工具，自动对比“首次执行生成的日志”与“重放执行生成的日志”是否完全匹配（包括 Kind/Label 顺序、Payload 内容）。
+* **强制手段**：通过日志对比辅助函数（engine 包内为 `logsEqual`）自动比较“首次执行生成的日志”与“重放执行生成的日志”是否完全匹配（包括 Kind/Label 顺序、Payload 内容）。
 
 ### 12.2 时间穿越约束
 
@@ -617,7 +631,8 @@ type Cloner interface {
 
 为支持上述测试约束，`infra/memory` 包必须提供满足以下能力的实现：
 
-1. **可控的 Mailbox**：支持手动 `Push` 信号，并验证 `Ack` 是否在正确的时机被调用。
+1. **可控的 Mailbox**：支持手动 `Push` 信号，并验证 `Ack` 是否在正确的时机被调用；
+   另提供观测钩子 `PushCount(runID, signal)`（Push 次数）与 `Has(runID, signal)`（未消费信号存在性）。
 2. **可观测的 Locker**：支持查看当前锁的持有状态，模拟锁过期。
 3. **可观测的 Log**：支持按追加顺序读取全部条目（`Reader.Read`），用于验证 Kind/Label/Payload 写入的正确性。
 

@@ -130,7 +130,8 @@ run(ctx, runID)
  4. 版本校验 meta.Version vs reg.version ──不符──► fail(ErrVersionMismatch)
  5. Read 日志 → 构建 WorkflowContext{ journal=logs, isReplay=(len>0), cursor=0 }
  6. UpdateStatus(Running)
- 7. runErr = fn(wf)                  执行业务函数
+ 7. runErr = execWorkflow(wf, fn)    执行业务函数（panic 被捕获转换为普通错误，
+                                      不击穿 Worker goroutine）
  8. switch runErr:                   按哨兵错误转换状态（见 §6 状态机）
  9. defer Release 锁
 ```
@@ -170,6 +171,8 @@ run(ctx, runID)
 | `ErrSleeping` | `StatusAwaiting` + `scheduleWakeup(sleepDeadline)` | 非终态 |
 | `ErrAwaiting` | `StatusAwaiting` + `scheduleWakeup(awaitDeadline)` | 非终态 |
 | 非哨兵错误 + `ctx.Err()!=nil` | **保持 Running**（不判失败），交由重启 Recover 重放 | 非终态 |
+| 存储瞬时故障（`Append`/`Fetch` 失败，包装为 storageError） | **保持 Running**（不判失败），交 Recover 幂等重试（条目未写入，重放不会重复） | 非终态 |
+| 业务函数 panic | 捕获 → `fail("workflow: business function panicked: ...")`，Worker 存活 | Failed |
 | 其它（非哨兵错误） | `fail(msg)` | Failed |
 
 > **优雅关停不判失败**：`Stop` 取消内部 ctx 后，执行中的工作流被中断（`Execute` 在重试入口感知

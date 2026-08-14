@@ -94,7 +94,10 @@ func (s *scheduler) scheduleWakeup(runID model.RunID, deadline time.Time) {
 	}
 	remaining := deadline.Sub(s.engine.clock.Now())
 	if remaining <= 0 {
-		s.engine.dispatch(runID)
+		// 已到期：立即重投。经 goroutine 异步执行——RunSync 模式下当前 run
+		// 仍持有锁，同步重入会因 Acquire 失败而丢失本次唤醒；异步也与
+		// 定时器触发路径（goroutine 内 dispatch）保持一致。
+		go s.engine.dispatch(runID)
 		return
 	}
 

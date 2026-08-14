@@ -98,9 +98,10 @@ func (e *Engine) Start(ctx context.Context, name string, input any) (model.RunID
 	}
 
 	// 首次 Start 自动触发 Recover 扫描（恢复因崩溃遗留的任务）。
+	// 排除本次刚创建的实例：它随后的 dispatch 会投递，避免同实例双投递。
 	e.recoverOnce.Do(func() {
 		if !e.testOpts.noAutoRecover {
-			if rerr := e.Recover(ctx); rerr != nil {
+			if rerr := e.recoverExcept(ctx, runID); rerr != nil {
 				log.Printf("engine: auto recover failed: %v", rerr)
 			}
 		}
@@ -157,11 +158,19 @@ func (e *Engine) Stop(ctx context.Context) error {
 // Recover 扫描存储中处于 Running/Awaiting 的实例，重新推入队列恢复执行
 // （设计文档第 8 节“持久化兜底机制”）。
 func (e *Engine) Recover(ctx context.Context) error {
+	return e.recoverExcept(ctx, "")
+}
+
+// recoverExcept 同 Recover，但跳过 exclude 指定的实例（空值表示不排除）。
+func (e *Engine) recoverExcept(ctx context.Context, exclude model.RunID) error {
 	metas, err := e.store.ListByStatus(ctx, model.StatusRunning, model.StatusAwaiting)
 	if err != nil {
 		return err
 	}
 	for _, m := range metas {
+		if m.RunID == exclude {
+			continue
+		}
 		e.dispatch(m.RunID)
 	}
 	return nil

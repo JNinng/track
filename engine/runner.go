@@ -53,7 +53,8 @@ func (e *Engine) run(ctx context.Context, runID model.RunID) {
 	}
 
 	// 版本校验：防止代码变更破坏重放确定性。
-	if meta.Version != "" && reg.version != meta.Version {
+	// 严格比较（含空版本）：引擎 Start 恒写入版本号，不一致或缺失均拒绝重放。
+	if reg.version != meta.Version {
 		e.fail(ctx, runID, ErrVersionMismatch.Error())
 		return
 	}
@@ -85,8 +86,8 @@ func (e *Engine) run(ctx context.Context, runID model.RunID) {
 		return
 	}
 
-	// 6. 执行业务。
-	runErr := reg.fn(wf)
+	// 6. 执行业务（panic 被转换为该实例的失败，不击穿 Worker goroutine）。
+	runErr := e.execWorkflow(wf, reg.fn)
 
 	switch {
 	case runErr == nil:
@@ -124,11 +125,30 @@ func (e *Engine) run(ctx context.Context, runID model.RunID) {
 		// 已落盘的 journal 步骤在重放时命中跳过，未执行的那一步会被重新执行，
 		// 故真正的业务错误（若存在）会在重启后正常运行时再次暴露并判 Failed。
 		log.Printf("engine: run %s interrupted by shutdown, left Running for recovery", runID)
+	case isStorageError(runErr):
+		// 存储瞬时故障（Append/Fetch 失败等）：非业务错误，不判终态失败。
+		// 条目未写入，重试幂等安全；保持 Running 交由 Recover 兜底重试，
+		// 避免一次网络抖动永久杀死长时工作流。
+		log.Printf("engine: run %s hit transient storage failure, left Running for recovery: %v", runID, runErr)
 	default:
 		// 业务返回普通 error 或原语返回 ErrJournalMismatch 等：标记失败。
 		// 若是 divergence（如 ErrJournalMismatch），其本身即错误信息。
 		e.fail(ctx, runID, runErr.Error())
 	}
+}
+
+// execWorkflow 执行业务函数，将 panic 转换为普通错误返回。
+//
+// 若不捕获，业务函数（或 Execute 注入的 fn）的 panic 会沿 Worker goroutine
+// 向上冒泡导致整个进程崩溃——远比单实例失败严重。捕获后仅将该实例标记为
+// StatusFailed（错误信息含 panic 值），Worker 继续存活处理其它任务。
+func (e *Engine) execWorkflow(wf *WorkflowContext, fn WorkflowFunc) (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("workflow: business function panicked: %v", r)
+		}
+	}()
+	return fn(wf)
 }
 
 // failOnJournalDrift 检测终态时历史是否有未被消费的残余条目。

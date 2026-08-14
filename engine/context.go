@@ -81,11 +81,15 @@ func (wf *WorkflowContext) consume(want ...model.EntryKind) (*model.LogEntry, er
 // commit 追加并持久化一条新日志条目（首次执行某步骤、consume 未命中时调用）。
 //
 // 追加后推进 cursor 至末尾，维持“cursor == len(journal)”的耗尽不变量，
-// 使后续原语继续从末尾开始判定。Label 写入条目供可读，不影响身份。
+// 使后续原语继续从末尾开始判定。Label 写入条目供可读，不影响身份（Err 恒空：
+// 失败的步骤不落盘，见 Execute 契约）。
+//
+// Append 失败包装为 storageError：条目尚未写入，重试幂等安全（重放不会重复），
+// 由 run 循环保持 Running、交 Recover 兜底，而非误判为业务终态失败。
 func (wf *WorkflowContext) commit(kind model.EntryKind, label string, payload []byte) error {
 	entry := model.LogEntry{Kind: kind, Label: label, Payload: payload}
 	if err := wf.writer.Append(wf.ctx, wf.runID, entry); err != nil {
-		return err
+		return &storageError{err: err}
 	}
 	wf.journal = append(wf.journal, entry)
 	wf.cursor = len(wf.journal)
@@ -300,7 +304,9 @@ func (wf *WorkflowContext) Await(signal model.Signal, timeout time.Duration, opt
 		return payload, nil
 	}
 	if !errors.Is(ferr, store.ErrNotFound) {
-		return nil, ferr
+		// 非“不存在”的 Fetch 失败是存储瞬时故障：包装为 storageError，
+		// 由 run 循环保持 Running 交 Recover 重试，不判终态失败。
+		return nil, &storageError{err: ferr}
 	}
 
 	// 4. 信箱确无信号：若已超时，持久化超时决策并返回。

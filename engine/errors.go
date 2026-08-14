@@ -52,3 +52,19 @@ func IsVersionMismatch(err error) bool { return errors.Is(err, ErrVersionMismatc
 
 // IsJournalMismatch 报告 err 是否为重放时 journal 与代码路径不一致错误。
 func IsJournalMismatch(err error) bool { return errors.Is(err, ErrJournalMismatch) }
+
+// storageError 标记存储层的瞬时故障（Append/Fetch 等失败），区别于业务错误。
+//
+// 语义：存储读写失败是基础设施故障，不得把实例判为终态 Failed（否则一次网络
+// 抖动就会永久杀死长时工作流）。run 循环捕获本类错误后仅记日志、保持 Running，
+// 交由 Recover 兜底幂等重试——与优雅关停中断的处理同构。
+type storageError struct{ err error }
+
+func (e *storageError) Error() string { return "workflow: transient storage failure: " + e.err.Error() }
+func (e *storageError) Unwrap() error { return e.err }
+
+// isStorageError 报告 err（含包装链）是否为存储瞬时故障。
+func isStorageError(err error) bool {
+	var s *storageError
+	return errors.As(err, &s)
+}
