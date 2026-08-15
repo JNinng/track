@@ -82,9 +82,12 @@ func (s *scheduler) enqueue(runID model.RunID, source string) {
 	select {
 	case s.queue <- task{runID: runID, source: source}:
 	default:
+		s.engine.metrics.queueDropped.Inc()
 		logWith(s.engine.logger, slog.LevelWarn, "engine: task queue full, dropping run",
 			slog.String(observ.AttrRunID, string(runID)))
 	}
+	// 队列深度为资源状态量：无论入队或丢弃都反映当前真实水位。
+	s.engine.metrics.queueDepth.Set(float64(len(s.queue)))
 }
 
 // scheduleWakeup 在 deadline 到达时把 runID 重新推入队列。

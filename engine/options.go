@@ -71,6 +71,18 @@ func WithLogger(l observ.Logger) EngineOption {
 	}
 }
 
+// WithMeter 注入指标出口（observ.Meter）。
+//
+// 未注入时默认 NoopMeter（零输出、零开销）。注入会触发全部指标句柄的
+// 构造期创建（observ 规范：New* 仅允许在构造期调用）。
+func WithMeter(m observ.Meter) EngineOption {
+	return func(e *Engine) {
+		if m != nil {
+			e.metrics = newMetrics(m)
+		}
+	}
+}
+
 // WithWorkers 设置 Worker Pool 的大小。
 func WithWorkers(n int) EngineOption {
 	return func(e *Engine) {

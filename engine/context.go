@@ -35,6 +35,7 @@ type WorkflowContext struct {
 	writer   store.Writer  // 用于追加日志
 	mailbox  store.Mailbox // 用于 Await 的信号存取
 	logger   observ.Logger // 观测日志出口（继承自 Engine，仅低频事件）
+	metrics  *metrics      // 指标句柄（继承自 Engine，热路径 Inc）
 
 	// returnData 由 Return 原语暂存已序列化的终态结果（落盘的 KindReturn payload），
 	// 引擎捕获 ErrReturn 后直接作为输出写入 RunMeta。首次执行与重放统一为 []byte：
@@ -93,6 +94,7 @@ func (wf *WorkflowContext) commit(kind model.EntryKind, label string, payload []
 	if err := wf.writer.Append(wf.ctx, wf.runID, entry); err != nil {
 		return &storageError{err: err}
 	}
+	wf.metrics.journalAppended.Inc()
 	wf.journal = append(wf.journal, entry)
 	wf.cursor = len(wf.journal)
 	return nil
@@ -299,6 +301,7 @@ func (wf *WorkflowContext) Await(signal model.Signal, timeout time.Duration, opt
 		}
 		// 消费闭环（signal received → consumed）：决策已落盘后记录，
 		// 信号真正被工作流取用——若 received 后始终无 consumed，信号即滞留/丢失。
+		wf.metrics.signalsConsumed.Inc()
 		logWith(wf.logger, slog.LevelInfo, "engine: signal consumed",
 			slog.String(observ.AttrRunID, string(wf.runID)),
 			slog.String("signal", string(signal)))

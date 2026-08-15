@@ -35,6 +35,11 @@ type Engine struct {
 	// 并固定（快照语义），可用 WithLogger 注入其它实现。
 	logger observ.Logger
 
+	// metrics 是引擎全部指标句柄（observ.Meter，见 metrics.go）：
+	// NewEngine 构造期经 newMetrics 一次构建，默认 NoopMeter（零输出零开销），
+	// 可用 WithMeter 注入。热路径只做 Inc/Observe，不改变执行语义。
+	metrics *metrics
+
 	mu     sync.RWMutex
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -54,6 +59,7 @@ func NewEngine(s store.Interface, opts ...EngineOption) *Engine {
 		workers:         defaultWorkers,
 		recoverInterval: 30 * time.Second,
 		logger:          observ.NewSlogLogger(slog.Default()),
+		metrics:         newMetrics(observ.NoopMeter),
 		ctx:             ctx,
 		cancel:          cancel,
 	}
@@ -151,6 +157,7 @@ func (e *Engine) Signal(ctx context.Context, runID model.RunID, signal model.Sig
 	if m.Status.IsTerminal() {
 		// 已终态：信号无意义，no-op。Debug 级记录——外部发送方拿到 nil 但信号
 		// 未生效时，这是唯一的排查线索（如工作流已超时完成、信号晚到）。
+		e.metrics.signalsIgnored.Inc()
 		if e.logger.Enabled(slog.LevelDebug) {
 			logWith(e.logger, slog.LevelDebug, "engine: signal ignored, run already terminal",
 				slog.String(observ.AttrRunID, string(runID)),
@@ -170,6 +177,7 @@ func (e *Engine) Signal(ctx context.Context, runID model.RunID, signal model.Sig
 	if err := e.store.Push(ctx, runID, signal, pb); err != nil {
 		return err
 	}
+	e.metrics.signalsReceived.Inc()
 	// API 事件：信号已持久化并唤醒实例（低频）。消费侧见 Await 的
 	// signal consumed——received 后无 consumed 即信号滞留/丢失。
 	logWith(e.logger, slog.LevelInfo, "engine: signal received",
@@ -213,6 +221,7 @@ func (e *Engine) recoverExcept(ctx context.Context, exclude model.RunID) error {
 	if err != nil {
 		return err
 	}
+	e.metrics.recoverScans.Inc()
 	dispatched := 0
 	for _, m := range metas {
 		if m.RunID == exclude {
@@ -260,6 +269,7 @@ func (e *Engine) recoverLoop() {
 // source 标识本次投递的来源（见 dispatch source 常量），纯观测元数据：
 // 只进日志、不落盘、不参与重放匹配，对确定性零影响。
 func (e *Engine) dispatch(runID model.RunID, source string) {
+	e.metrics.incDispatch(source)
 	if e.testOpts.runSync {
 		e.run(e.ctx, runID, source)
 		return

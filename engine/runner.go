@@ -24,6 +24,10 @@ import (
 //  4. 执行业务函数，按返回的哨兵错误转换状态。
 //  5. 持久化状态，注册必要的唤醒定时器，释放锁。
 func (e *Engine) run(ctx context.Context, runID model.RunID, source string) {
+	// 单次 run 尝试耗时（含重放）：无论终局如何都观测（纯旁路）。
+	started := time.Now()
+	defer e.metrics.observeRunDuration(started)
+
 	// 投递来源归属（Debug，门控）：回答「这次执行由谁触发」。并发交织下
 	// 相邻日志（signal received / wakeup fired 等）不再可靠，per-run 的
 	// source 是确定性归属。queue 可能延迟，本行在出队后、执行前打印。
@@ -42,6 +46,7 @@ func (e *Engine) run(ctx context.Context, runID model.RunID, source string) {
 	}
 	if !ok {
 		// 已有其它 Worker 持有锁：多 Worker 下的正常竞争，仅 Debug 级记录。
+		e.metrics.lockContended.Inc()
 		if e.logger.Enabled(slog.LevelDebug) {
 			logWith(e.logger, slog.LevelDebug, "engine: lock contended, run skipped",
 				slog.String(observ.AttrRunID, string(runID)))
@@ -101,6 +106,7 @@ func (e *Engine) run(ctx context.Context, runID model.RunID, source string) {
 		writer:   e.store,
 		mailbox:  e.store,
 		logger:   e.logger,
+		metrics:  e.metrics,
 	}
 
 	// 重放模式锚定（历史日志非空）：确定性调试的关键钩子，仅 Debug 级（门控）。
@@ -145,6 +151,7 @@ func (e *Engine) run(ctx context.Context, runID model.RunID, source string) {
 		// 挂起时间线只有日志能留下（meta 只存当前状态 + 最后一次 UpdatedAt）。
 		// message 区分挂起原语（sleep/await）：同一实例可多次挂起，仅看 deadline 易误读；
 		// 措辞与哨兵错误（ErrSleeping/ErrAwaiting）及 journal Kind 同词汇。
+		e.metrics.runsSuspended.Inc()
 		logWith(e.logger, slog.LevelInfo, "engine: run sleeping",
 			slog.String(observ.AttrRunID, string(runID)),
 			slog.String(observ.AttrWorkflow, meta.Name),
@@ -157,6 +164,7 @@ func (e *Engine) run(ctx context.Context, runID model.RunID, source string) {
 				slog.String(observ.AttrRunID, string(runID)), slog.Any("error", err))
 			return
 		}
+		e.metrics.runsSuspended.Inc()
 		logWith(e.logger, slog.LevelInfo, "engine: run awaiting",
 			slog.String(observ.AttrRunID, string(runID)),
 			slog.String(observ.AttrWorkflow, meta.Name),
@@ -169,12 +177,14 @@ func (e *Engine) run(ctx context.Context, runID model.RunID, source string) {
 		// （Failed 为终态，Recover 跳过，造成在途工作流永久丢失）。
 		// 已落盘的 journal 步骤在重放时命中跳过，未执行的那一步会被重新执行，
 		// 故真正的业务错误（若存在）会在重启后正常运行时再次暴露并判 Failed。
+		e.metrics.runsInterrupted.Inc()
 		logWith(e.logger, slog.LevelInfo, "engine: run interrupted by shutdown, left Running for recovery",
 			slog.String(observ.AttrRunID, string(runID)))
 	case isStorageError(runErr):
 		// 存储瞬时故障（Append/Fetch 失败等）：非业务错误，不判终态失败。
 		// 条目未写入，重试幂等安全；保持 Running 交由 Recover 兜底重试，
 		// 避免一次网络抖动永久杀死长时工作流。
+		e.metrics.runsInterrupted.Inc()
 		logWith(e.logger, slog.LevelWarn, "engine: run hit transient storage failure, left Running for recovery",
 			slog.String(observ.AttrRunID, string(runID)), slog.Any("error", runErr))
 	default:
@@ -233,6 +243,7 @@ func (e *Engine) succeed(ctx context.Context, runID model.RunID, name string, ou
 			slog.String(observ.AttrRunID, string(runID)), slog.Any("error", err))
 		return
 	}
+	e.metrics.runsSucceeded.Inc()
 	logWith(e.logger, slog.LevelInfo, "engine: run completed",
 		slog.String(observ.AttrRunID, string(runID)),
 		slog.String(observ.AttrWorkflow, name))
@@ -246,6 +257,7 @@ func (e *Engine) fail(ctx context.Context, runID model.RunID, name, msg string) 
 			slog.String(observ.AttrRunID, string(runID)), slog.Any("error", err))
 		return
 	}
+	e.metrics.runsFailed.Inc()
 	logWith(e.logger, slog.LevelError, "engine: run failed",
 		slog.String(observ.AttrRunID, string(runID)),
 		slog.String(observ.AttrWorkflow, name),
