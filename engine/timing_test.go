@@ -139,6 +139,69 @@ func TestSleepCompletedThenAwaitNoBusyLoop(t *testing.T) {
 	}
 }
 
+// 回归：Await(timeout>0) 超时决策后，紧随的 Await(timeout=0) 挂起时不得沿用
+// 前者遗留的过期 awaitDeadline——否则 scheduleWakeup 走立即重投分支，
+// 挂起-重投-再挂起形成紧忙循环（契约 §7.2「唤醒时刻的选取」的同类场景，
+// 此前只防了 sleepDeadline 串场，未防 awaitDeadline 自身跨调用的陈旧值）。
+func TestTimedoutAwaitThenNoTimeoutAwaitNoBusyLoop(t *testing.T) {
+	clk := clock.NewFakeClock()
+	s := memory.New()
+	e := NewEngine(s, WithClock(clk))
+	e.SetTestOptions(TestOptions{RunSync: true, NoAutoRecover: true})
+	defer e.Stop(context.Background())
+
+	var entries int32
+	e.Register("w", func(wf *WorkflowContext) error {
+		atomic.AddInt32(&entries, 1)
+		// Await#1：带超时。首次挂起设置 awaitDeadline=T0+5s。
+		if _, err := wf.Await("approval", 5*time.Second); err != nil {
+			if !IsAwaitTimeout(err) {
+				return err
+			}
+			// 超时降级后继续。
+		}
+		// Await#2：无超时。按契约仅等待外部 Signal，不得注册任何唤醒定时器。
+		_, err := wf.Await("fulfillment", 0)
+		return err
+	})
+
+	rid, err := e.Start(context.Background(), "w", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := atomic.LoadInt32(&entries); got != 1 {
+		t.Fatalf("entries=%d, want 1 (suspended on first Await)", got)
+	}
+
+	// 推进至 Await#1 超时：定时器唤醒重入一次，Await#2 挂起（异步唤醒，轮询确认）。
+	clk.Advance(5 * time.Second)
+	if !waitForCond(time.Second, func() bool { return atomic.LoadInt32(&entries) >= 2 }) {
+		t.Fatalf("entries=%d, want 2 (timeout wakeup must run exactly once)", atomic.LoadInt32(&entries))
+	}
+
+	// 稳定窗口：无超时的 Await 挂起后不得再有任何重入（无定时器、无立即重投）。
+	time.Sleep(150 * time.Millisecond)
+	if got := atomic.LoadInt32(&entries); got != 2 {
+		t.Fatalf("busy loop: workflow body entered %d times, want 2 (stale awaitDeadline requeued run)", got)
+	}
+	m, _ := e.GetResult(context.Background(), rid)
+	if m.Status != model.StatusAwaiting {
+		t.Fatalf("status=%s, want Awaiting (suspended on timeout-less Await)", m.Status)
+	}
+	if clk.HasPendingTimers() {
+		t.Fatal("no wakeup timer expected for timeout-less Await")
+	}
+
+	// 挂起语义未受影响：信号到达后正常完成。
+	if err := e.Signal(context.Background(), rid, "fulfillment", "ok"); err != nil {
+		t.Fatal(err)
+	}
+	m = waitFor(t, e, rid, time.Second)
+	if m.Status != model.StatusSucceeded {
+		t.Fatalf("status=%s err=%s, want Succeeded after signal", m.Status, m.Err)
+	}
+}
+
 // ---- Await 等待原语（设计文档 6.4）----
 
 func TestAwaitReceivesSignal(t *testing.T) {

@@ -276,6 +276,11 @@ func (wf *WorkflowContext) Await(signal model.Signal, timeout time.Duration, opt
 			}
 		}
 		wf.awaitDeadline = deadline
+	} else {
+		// 本 Await 无超时：必须清零历史值（契约 §7.2：零值表示不注册定时器、
+		// 仅等待外部 Signal）。否则沿用本 run 更早的 Await 遗留的过期
+		// awaitDeadline，引擎会注册立即触发的唤醒，挂起-重投-再挂起形成紧忙循环。
+		wf.awaitDeadline = time.Time{}
 	}
 
 	// 2. 已决策的结果（超时 / 消费成功）按位置消费。

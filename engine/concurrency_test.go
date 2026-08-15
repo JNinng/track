@@ -328,3 +328,49 @@ func TestShutdownInterruptedWorkflowRecoversOnRestart(t *testing.T) {
 		t.Fatalf("status=%s err=%q, want Succeeded after recover-replay", m.Status, m.Err)
 	}
 }
+
+// 唤醒定时器的代次隔离：被取消的旧定时器 goroutine 退出时的延迟清理，
+// 不得移除/取消随后新登记的定时器——否则新唤醒被静默丢失，实例滞留挂起
+// 直至下一次 Signal/Recover 兜底（禁用周期 Recover 的部署下即无限滞留）。
+//
+// 交错场景：挂起登记 handle A → Signal 入队（clearTimer 取消 A）→ 工作流
+// 重新挂起、登记 handle B → A 的 goroutine 才被调度、执行延迟清理。
+// 此处直接驱动定时器登记表模拟该交错，确定性复现代次混淆；真实时序下
+// 该窗口为纯 goroutine 调度延迟（-race 无法检出，属逻辑竞态）。
+func TestWakeupTimerGenerationIsolation(t *testing.T) {
+	e := NewEngine(memory.New(), WithClock(clock.NewFakeClock()))
+	defer e.Stop(context.Background())
+	sch := newScheduler(e, 1, 1)
+
+	// 以真实 ctx/cancel 对构造两个代次的句柄，便于断言「是否被取消」。
+	_, cancelA := context.WithCancel(context.Background())
+	defer cancelA()
+	hA := &timerHandle{cancel: cancelA}
+	ctxB, cancelB := context.WithCancel(context.Background())
+	defer cancelB()
+	hB := &timerHandle{cancel: cancelB}
+
+	sch.registerTimer("run_x", hA) // 首次挂起：登记 A。
+	sch.registerTimer("run_x", hB) // 重新挂起：B 替换 A（A 被取消，语义保留）。
+
+	// A 的 goroutine 此刻才执行延迟清理（迟于 B 的登记）：只能清理自己。
+	sch.clearTimerIf("run_x", hA)
+	sch.timersMu.Lock()
+	cur, ok := sch.timers["run_x"]
+	sch.timersMu.Unlock()
+	if !ok || cur != hB {
+		t.Fatal("stale timer's deferred cleanup must not remove the newly registered wakeup")
+	}
+	if ctxB.Err() != nil {
+		t.Fatal("stale timer's deferred cleanup must not cancel the newly registered wakeup")
+	}
+
+	// 本人的延迟清理仍有效：定时器正常触发/被替换后退场，能移除自己。
+	sch.clearTimerIf("run_x", hB)
+	sch.timersMu.Lock()
+	_, ok = sch.timers["run_x"]
+	sch.timersMu.Unlock()
+	if ok {
+		t.Fatal("own cleanup must remove its timer entry")
+	}
+}

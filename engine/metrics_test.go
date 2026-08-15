@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -295,5 +296,50 @@ func TestMetricsQueueDropAndDepth(t *testing.T) {
 	}
 	if err := e.Stop(context.Background()); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// queue_depth 必须在 Worker 消费后回落：gauge 是「当前深度」的资源状态量，
+// 若只在 enqueue 时更新，队列排空后指标停留在旧水位，系统性高估、误导告警。
+//
+// 用首个任务占住唯一 Worker，保证第二个任务入队后深度确定为 1（排除
+// enqueue 的 Set(len) 与 Worker 抢消费的竞态），再放行验证消费后归零。
+func TestMetricsQueueDepthDrainsAfterConsume(t *testing.T) {
+	m := newMemMeter()
+	s := memory.New()
+	e := NewEngine(s, WithClock(clock.NewFakeClock()), WithMeter(m), WithWorkers(1))
+	e.SetTestOptions(TestOptions{NoAutoRecover: true})
+	defer e.Stop(context.Background())
+
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	var calls int32
+	e.Register("w", func(wf *WorkflowContext) error {
+		if atomic.AddInt32(&calls, 1) == 1 {
+			close(entered)
+			<-release // 首个任务占住唯一 Worker。
+		}
+		return nil
+	})
+
+	rid1, err := e.Start(context.Background(), "w", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	<-entered // Worker 已进入首个任务（忙碌），后续入队不会被立即消费。
+
+	rid2, err := e.Start(context.Background(), "w", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := m.gauge("track_queue_depth"); got != 1 {
+		t.Fatalf("precondition: queue depth = %v, want 1 (rid2 queued behind busy worker)", got)
+	}
+
+	close(release) // 放行：Worker 依次完成 rid1、消费 rid2。
+	waitStatus(t, e, rid2, model.StatusSucceeded, time.Second)
+	waitStatus(t, e, rid1, model.StatusSucceeded, time.Second)
+	if got := m.gauge("track_queue_depth"); got != 0 {
+		t.Fatalf("queue depth = %v after queue drained, want 0", got)
 	}
 }

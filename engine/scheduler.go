@@ -23,7 +23,15 @@ type scheduler struct {
 	engine   *Engine
 	workers  int
 	timersMu sync.Mutex
-	timers   map[model.RunID]context.CancelFunc // 活跃的唤醒定时器取消句柄
+	timers   map[model.RunID]*timerHandle // 活跃的唤醒定时器句柄（按 RunID 登记最新代次）
+}
+
+// timerHandle 是一次唤醒定时器登记的句柄；指针身份即代次标识。
+//
+// 定时器 goroutine 退出时的延迟清理（clearTimerIf）按指针比较确认登记的
+// 仍是自己，防止被取消的旧代次误删随后新登记的定时器（丢唤醒）。
+type timerHandle struct {
+	cancel context.CancelFunc
 }
 
 // task 是队列元素：RunID 及其投递来源（纯观测元数据，随日志输出）。
@@ -43,7 +51,7 @@ func newScheduler(e *Engine, workers, queueSize int) *scheduler {
 		queue:   make(chan task, queueSize),
 		engine:  e,
 		workers: workers,
-		timers:  make(map[model.RunID]context.CancelFunc),
+		timers:  make(map[model.RunID]*timerHandle),
 	}
 }
 
@@ -59,6 +67,9 @@ func (s *scheduler) start() {
 func (s *scheduler) worker() {
 	defer s.wg.Done()
 	for t := range s.queue {
+		// 队列深度为资源状态量：消费侧同样更新，否则排空后指标停留在
+		// 最后一次入队时的水位（只高不低，误导告警口径）。
+		s.engine.metrics.queueDepth.Set(float64(len(s.queue)))
 		s.engine.run(s.engine.ctx, t.runID, t.source)
 	}
 }
@@ -125,9 +136,10 @@ func (s *scheduler) scheduleWakeup(runID model.RunID, deadline time.Time) {
 	// 同步注册定时器通道，确保 deadline 锚定在当前时刻。
 	timerCh := s.engine.clock.After(remaining)
 	ctx, cancel := context.WithCancel(s.engine.ctx)
-	s.registerTimer(runID, cancel)
+	h := &timerHandle{cancel: cancel}
+	s.registerTimer(runID, h)
 	go func() {
-		defer s.clearTimer(runID)
+		defer s.clearTimerIf(runID, h)
 		select {
 		case <-timerCh:
 			if s.engine.logger.Enabled(slog.LevelDebug) {
@@ -172,34 +184,57 @@ func (s *scheduler) stop(ctx context.Context) error {
 	}
 
 	s.timersMu.Lock()
-	for _, cancel := range s.timers {
-		cancel()
+	for _, h := range s.timers {
+		h.cancel()
 	}
-	s.timers = make(map[model.RunID]context.CancelFunc)
+	s.timers = make(map[model.RunID]*timerHandle)
 	s.timersMu.Unlock()
 
 	return err
 }
 
-// clearTimer 从活跃定时器表中移除并取消某实例的定时器。
+// clearTimer 从活跃定时器表中移除并取消 runID 当前登记的定时器（任意代次）。
+//
+// 用于任务重新入队前取消旧的未触发定时器（避免重复入队叠加）：此时登记的
+// 必然是本 runID 的上一个代次，无需代次校验。
 func (s *scheduler) clearTimer(runID model.RunID) {
 	s.timersMu.Lock()
-	cancel, ok := s.timers[runID]
+	h, ok := s.timers[runID]
 	if ok {
 		delete(s.timers, runID)
 	}
 	s.timersMu.Unlock()
-	if cancel != nil {
-		cancel()
+	if ok {
+		h.cancel()
+	}
+}
+
+// clearTimerIf 移除并取消 runID 的定时器，仅当登记的仍是 h 本人（按指针
+// 比较代次）。定时器 goroutine 退出时经此清理自己。
+//
+// 它可能迟于「取消 → 工作流重新挂起 → 登记新代次」的交错才执行：若像
+// clearTimer 那样无条件清除，会误删并误取消新一代定时器，唤醒被静默
+// 丢失，实例滞留挂起直至下一次 Signal/Recover 兜底。代次校验后，旧代次
+// 的延迟清理只能作用于自己。
+func (s *scheduler) clearTimerIf(runID model.RunID, h *timerHandle) {
+	s.timersMu.Lock()
+	cur, ok := s.timers[runID]
+	own := ok && cur == h
+	if own {
+		delete(s.timers, runID)
+	}
+	s.timersMu.Unlock()
+	if own {
+		h.cancel() // 释放 ctx 资源（幂等）。
 	}
 }
 
 // registerTimer 记录一个活跃的唤醒定时器，若已存在则先取消旧的。
-func (s *scheduler) registerTimer(runID model.RunID, cancel context.CancelFunc) {
+func (s *scheduler) registerTimer(runID model.RunID, h *timerHandle) {
 	s.timersMu.Lock()
 	if old, ok := s.timers[runID]; ok {
-		old()
+		old.cancel()
 	}
-	s.timers[runID] = cancel
+	s.timers[runID] = h
 	s.timersMu.Unlock()
 }

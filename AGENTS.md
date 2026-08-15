@@ -20,7 +20,10 @@ go vet ./...            # static checks
 go run ./examples       # run the hello workflow end-to-end
 ```
 
-No external deps / no Makefile / no codegen. Single import root.
+One dependency: `github.com/jninng/observ` (zero-dep Logger/Meter contract module,
+used by `engine` for logs & metrics). No other external deps / no Makefile / no
+codegen. Single import root — the prometheus dep tree stays isolated in the
+separate `examples/observability` module.
 
 ## Directory map
 
@@ -51,7 +54,8 @@ docs/track.md   the contract
   `*engine.WorkflowContext` accessors and primitives. It must not touch internal
   fields, storage, or clocks directly.
 - Dependency injection is explicit (WorkflowContext param, option funcs,
-  `WithClock`/`WithWorkers`/`WithQueueSize`/`WithRecoverInterval`). No `context.Value`.
+  `WithClock`/`WithWorkers`/`WithQueueSize`/`WithRecoverInterval`/
+  `WithLogger`/`WithMeter`). No `context.Value`.
 
 ## Determinism / replay invariants — DO NOT BREAK
 

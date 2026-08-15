@@ -1,5 +1,6 @@
 // 独立模块：把 prometheus 依赖树隔离在示例内，
-// 引擎根模块保持零第三方依赖（与 observ 自身 adapters 独立成模块同理）。
+// 引擎根模块仅依赖 observ 契约模块、不引入 prometheus（与 observ 自身
+// adapters 独立成模块同理）。
 //
 // 运行：cd examples/observability && go run .
 module github.com/jninng/track/examples/observability

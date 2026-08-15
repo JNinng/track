@@ -58,7 +58,7 @@ func NewEngine(s store.Interface, opts ...EngineOption) *Engine {
 		clock:           clock.RealClock{},
 		workers:         defaultWorkers,
 		recoverInterval: 30 * time.Second,
-		logger:          observ.NewSlogLogger(slog.Default()),
+		logger:          observ.DefaultLogger(),
 		metrics:         newMetrics(observ.NoopMeter),
 		ctx:             ctx,
 		cancel:          cancel,

@@ -299,3 +299,37 @@ func (r *recordingLogger) msgsOf() []string {
 	}
 	return out
 }
+
+// 默认 logger 快照语义：未注入 WithLogger 时，NewEngine 构造期读取
+// observ.DefaultLogger() 并固定——构造前 SetDefaultLogger 的值生效；
+// 构造后再替换包级默认不再影响本引擎。未设置时为 NoopLogger（零输出），
+// 引擎绝不默认向 slog.Default() 输出（库不应产生意外的 stderr 噪声）。
+func TestDefaultLoggerSnapshot(t *testing.T) {
+	logger := &recordingLogger{}
+	old := observ.SetDefaultLogger(logger)
+	defer observ.SetDefaultLogger(old)
+
+	s := memory.New()
+	e := NewEngine(s, WithClock(clock.NewFakeClock()))
+	e.SetTestOptions(TestOptions{RunSync: true, NoAutoRecover: true})
+	defer e.Stop(context.Background())
+
+	e.Register("w", func(wf *WorkflowContext) error { return nil })
+	if _, err := e.Start(context.Background(), "w", nil); err != nil {
+		t.Fatal(err)
+	}
+	if logger.find("engine: run started") == nil {
+		t.Fatal("engine must snapshot observ.DefaultLogger() at construction: pre-set default logger not used")
+	}
+
+	// 构造后再替换包级默认：本引擎已固定快照，继续向构造期 logger 输出、
+	// 不受新默认影响（若动态读取默认值，记录会改道 NoopLogger 而 recorder 归零）。
+	logger.reset()
+	observ.SetDefaultLogger(observ.NoopLogger)
+	if _, err := e.Start(context.Background(), "w", nil); err != nil {
+		t.Fatal(err)
+	}
+	if logger.find("engine: run started") == nil {
+		t.Fatal("engine snapshot must stay fixed: post-construction SetDefaultLogger must not redirect existing engine logs")
+	}
+}

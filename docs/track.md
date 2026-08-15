@@ -248,6 +248,15 @@ func WithQueueSize(n int) EngineOption
 // 周期扫描作为持久化兜底，重新推入因崩溃遗留或队列满被丢弃（状态保持）的实例。
 // d > 0 启用，d <= 0 禁用；缺省 30s。
 func WithRecoverInterval(d time.Duration) EngineOption
+// WithLogger 注入观测日志出口（observ.Logger 接口，级别复用 slog.Level）。
+// 缺省：NewEngine 构造期读取 observ.DefaultLogger() 并固定（快照语义）——
+// 未设置时为 NoopLogger（零输出），引擎绝不默认向 slog.Default() 写日志；
+// 构造后再替换包级默认不影响已构造的引擎。观测为纯旁路：仅低频生命周期
+// 事件，日志回调 panic 由引擎兜住，不得改变执行语义。
+func WithLogger(l observ.Logger) EngineOption
+// WithMeter 注入指标出口（observ.Meter 接口）。缺省 NoopMeter（零输出零开销）。
+// 指标句柄在构造期一次性创建，热路径只做 Inc/Observe，观测纯旁路。
+func WithMeter(m observ.Meter) EngineOption
 ```
 
 **`Signal` 的目标校验契约**：`Signal` 必须先确认目标实例存在且非终态，再持久化信号并唤醒，
