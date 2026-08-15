@@ -88,7 +88,7 @@ func TestExecuteRecordsAndReplays(t *testing.T) {
 	// 重放：直接再次运行，fn 不应被再次调用，日志不变。
 	golden := mustReadLogs(t, s, rid)
 	atomic.StoreInt32(&calls, 0)
-	e.run(context.Background(), rid)
+	e.run(context.Background(), rid, srcManual)
 	if atomic.LoadInt32(&calls) != 0 {
 		t.Fatalf("replay called fn %d times, want 0 (non-idempotent)", calls)
 	}
@@ -183,7 +183,7 @@ func TestLoopPositionalReplay(t *testing.T) {
 	}
 	// 重放：5 次均按位置命中历史，fn 不再调用。
 	atomic.StoreInt32(&calls, 0)
-	e.run(context.Background(), rid)
+	e.run(context.Background(), rid, srcManual)
 	if atomic.LoadInt32(&calls) != 0 {
 		t.Fatalf("replay re-executed loop steps: %d calls", calls)
 	}
@@ -206,7 +206,7 @@ func TestVersionMismatchOnReplay(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	e.run(context.Background(), rid)
+	e.run(context.Background(), rid, srcManual)
 	m, _ := e.GetResult(context.Background(), rid)
 	if m.Status != model.StatusFailed {
 		t.Fatalf("status=%s, want Failed on version mismatch", m.Status)
@@ -235,7 +235,7 @@ func TestJournalMismatchOnLeftoverEntries(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	e.run(context.Background(), rid)
+	e.run(context.Background(), rid, srcManual)
 	m, _ := e.GetResult(context.Background(), rid)
 	if m.Status != model.StatusFailed {
 		t.Fatalf("status=%s, want Failed on journal drift", m.Status)
@@ -266,7 +266,7 @@ func TestJournalMismatchOnNilReturnLeftover(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	e.run(context.Background(), rid)
+	e.run(context.Background(), rid, srcManual)
 	m, _ := e.GetResult(context.Background(), rid)
 	if m.Status != model.StatusFailed {
 		t.Fatalf("status=%s, want Failed on journal drift (nil-return path)", m.Status)
@@ -318,7 +318,7 @@ func TestLabelIsCosmeticAcrossReplay(t *testing.T) {
 	if err := s.UpdateStatus(context.Background(), rid, model.StatusRunning); err != nil {
 		t.Fatal(err)
 	}
-	e.run(context.Background(), rid)
+	e.run(context.Background(), rid, srcManual)
 
 	// 重放命中历史（KindExec 匹配），fn 不再执行；落盘 Label 仍是 "greet"。
 	if got := atomic.LoadInt32(&calls); got != 0 {

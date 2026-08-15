@@ -81,7 +81,7 @@ func TestWorkflowDeterminism(t *testing.T) {
 	atomic.StoreInt32(&serviceCalls, 0)
 
 	// ---- 3. 重放（模拟崩溃重启后重新加载实例）----
-	e.run(context.Background(), rid)
+	e.run(context.Background(), rid, srcManual)
 	m2 := awaitStatus(t, e, rid, time.Second)
 	if m2.Status != model.StatusSucceeded {
 		t.Fatalf("replay failed: %s %s", m2.Status, m2.Err)
@@ -206,7 +206,7 @@ func TestReturnResultIsReplayDeterministic(t *testing.T) {
 	if err := s.UpdateStatus(context.Background(), rid, model.StatusRunning); err != nil {
 		t.Fatal(err)
 	}
-	e.run(context.Background(), rid)
+	e.run(context.Background(), rid, srcManual)
 
 	// Execute 在重放时必须被跳过（命中历史）。
 	if got := atomic.LoadInt32(&execCalls); got != 0 {

@@ -96,7 +96,7 @@ func TestSleepDeadlinePersistsAcrossRuns(t *testing.T) {
 	}
 
 	// 再次运行（模拟崩溃重启）：deadline 应从历史恢复，不追加新日志。
-	e.run(context.Background(), rid)
+	e.run(context.Background(), rid, srcManual)
 	replay := mustReadLogs(t, s, rid)
 	if !logsEqual(golden, replay) {
 		t.Fatal("replay after sleep should not append logs")
@@ -228,7 +228,7 @@ func TestAwaitAckRemovesSignal(t *testing.T) {
 		t.Fatal("signal should be Ack'd after consumption")
 	}
 	// 重放不应再次“消费”或要求信号存在。
-	e.run(context.Background(), rid)
+	e.run(context.Background(), rid, srcManual)
 	if s.Has(rid, "ready") {
 		t.Fatal("signal reappeared after replay")
 	}
@@ -305,7 +305,7 @@ func TestAwaitTimeoutDecisionPersists(t *testing.T) {
 	s.Push(context.Background(), rid, "sig", []byte(`"LATE"`))
 
 	// 同步重放：确定性要求结果仍是 timed-out，迟到信号被忽略。
-	e.run(context.Background(), rid)
+	e.run(context.Background(), rid, srcManual)
 	m2, _ := e.GetResult(context.Background(), rid)
 	if string(m2.Output) != `"timed-out"` {
 		t.Fatalf("determinism broken: late signal changed output to %q", string(m2.Output))

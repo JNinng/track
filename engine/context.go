@@ -5,9 +5,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"log"
+	"log/slog"
 	"time"
 
+	"github.com/jninng/observ"
 	"github.com/jninng/track/clock"
 	"github.com/jninng/track/model"
 	"github.com/jninng/track/policy"
@@ -33,6 +34,7 @@ type WorkflowContext struct {
 	clock    clock.Clock
 	writer   store.Writer  // 用于追加日志
 	mailbox  store.Mailbox // 用于 Await 的信号存取
+	logger   observ.Logger // 观测日志出口（继承自 Engine，仅低频事件）
 
 	// returnData 由 Return 原语暂存已序列化的终态结果（落盘的 KindReturn payload），
 	// 引擎捕获 ErrReturn 后直接作为输出写入 RunMeta。首次执行与重放统一为 []byte：
@@ -295,11 +297,19 @@ func (wf *WorkflowContext) Await(signal model.Signal, timeout time.Duration, opt
 		if err := wf.commit(model.KindAwait, cfg.Label, payload); err != nil {
 			return nil, err
 		}
+		// 消费闭环（signal received → consumed）：决策已落盘后记录，
+		// 信号真正被工作流取用——若 received 后始终无 consumed，信号即滞留/丢失。
+		logWith(wf.logger, slog.LevelInfo, "engine: signal consumed",
+			slog.String(observ.AttrRunID, string(wf.runID)),
+			slog.String("signal", string(signal)))
 		// 决策已落盘（KindAwait），日志是确定性的真相：Ack 失败只留下孤儿信号，
 		// 不影响重放确定性（重放时 KindAwait 命中即返回，不再触达 Fetch/Ack），
 		// 故仅记日志、不判定工作流失败。
 		if err := wf.mailbox.Ack(wf.ctx, wf.runID, signal); err != nil {
-			log.Printf("engine: ack signal %s for %s failed: %v (decision already committed)", signal, wf.runID, err)
+			logWith(wf.logger, slog.LevelWarn, "engine: ack signal failed (decision already committed)",
+				slog.String(observ.AttrRunID, string(wf.runID)),
+				slog.String("signal", string(signal)),
+				slog.Any("error", err))
 		}
 		return payload, nil
 	}

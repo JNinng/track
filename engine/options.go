@@ -3,6 +3,7 @@ package engine
 import (
 	"time"
 
+	"github.com/jninng/observ"
 	"github.com/jninng/track/clock"
 	"github.com/jninng/track/policy"
 )
@@ -54,6 +55,18 @@ func WithClock(c clock.Clock) EngineOption {
 	return func(e *Engine) {
 		if c != nil {
 			e.clock = c
+		}
+	}
+}
+
+// WithLogger 注入观测日志出口（observ.Logger）。
+//
+// 未注入时，NewEngine 构造期读取 observ.DefaultLogger() 并固定（快照语义），
+// 之后对 observ.SetDefaultLogger 的调用不再影响本引擎。
+func WithLogger(l observ.Logger) EngineOption {
+	return func(e *Engine) {
+		if l != nil {
+			e.logger = l
 		}
 	}
 }

@@ -50,7 +50,7 @@ func TestLockMutualExclusion(t *testing.T) {
 
 	// 将同一 RunID 多次重新入队，模拟多个 Worker 竞争。
 	for i := 0; i < 8; i++ {
-		e.sched.enqueue(rid)
+		e.sched.enqueue(rid, srcManual)
 	}
 	// 给竞争 Worker 调度机会。
 	time.Sleep(30 * time.Millisecond)
@@ -88,7 +88,7 @@ func TestLockLeaseTakeover(t *testing.T) {
 	}
 
 	// 再次调度：应因锁被占用而无法进入，状态保持 Awaiting/Running 之外不会完成。
-	e.sched.enqueue(rid)
+	e.sched.enqueue(rid, srcManual)
 	time.Sleep(30 * time.Millisecond)
 	if atomic.LoadInt32(&done) != 0 {
 		t.Fatal("workflow ran while lock held by dead worker")
@@ -96,7 +96,7 @@ func TestLockLeaseTakeover(t *testing.T) {
 
 	// 锁租约过期 -> 后续 Worker 可接管。
 	s.Expire(rid)
-	e.sched.enqueue(rid)
+	e.sched.enqueue(rid, srcManual)
 	m := awaitStatus(t, e, rid, time.Second)
 	if m.Status != model.StatusSucceeded {
 		t.Fatalf("status=%s err=%s after takeover", m.Status, m.Err)

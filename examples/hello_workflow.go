@@ -11,9 +11,11 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"log"
+	"log/slog"
+	"os"
 	"time"
 
+	"github.com/jninng/observ"
 	"github.com/jninng/track/clock"
 	"github.com/jninng/track/engine"
 	"github.com/jninng/track/infra/memory"
@@ -28,34 +30,39 @@ type HelloInput struct {
 
 func main() {
 	// 1. 装配引擎：内存后端 + 默认 Worker Pool。
+	// 引擎内部日志经 observ.Logger 输出：此处桥接 slog 到 stderr，并开启
+	// Debug 级以展示完整时间线（唤醒调度/触发、重放等）；
+	// 不注入也不设置默认 Logger 时，引擎保持零输出。
+	logger := observ.NewSlogLogger(slog.New(slog.NewTextHandler(os.Stderr,
+		&slog.HandlerOptions{Level: slog.LevelDebug})))
 	store := memory.New()
-	e := engine.NewEngine(store, engine.WithWorkers(4), engine.WithClock(clock.RealClock{}))
+	e := engine.NewEngine(store, engine.WithWorkers(4), engine.WithClock(clock.RealClock{}),
+		engine.WithLogger(logger))
 	defer e.Stop(context.Background())
 
 	// 2. 注册工作流。
 	if err := e.Register("HelloWorkflow", HelloWorkflow); err != nil {
-		log.Fatal(err)
+		logger.Log(slog.LevelError, "register workflow failed", slog.Any("error", err))
+		os.Exit(1)
 	}
 
 	// 3. 启动一个新实例。
 	runID, err := e.Start(context.Background(), "HelloWorkflow", HelloInput{Name: "World"})
 	if err != nil {
-		log.Fatal(err)
+		logger.Log(slog.LevelError, "start workflow failed", slog.Any("error", err))
+		os.Exit(1)
 	}
 	fmt.Println("started run:", runID)
 
-	// 工作流会先 Sleep，再 Await 一个 "approved" 信号。稍后我们投递该信号。
-	go func() {
-		time.Sleep(100 * time.Millisecond)
-		if err := e.Signal(context.Background(), runID, "approved", map[string]string{"by": "ops"}); err != nil {
-			log.Println("signal error:", err)
-		}
-	}()
+	// 4. 投递信号：工作流先 Sleep（50ms）再 Await "approved" 信号，
+	// 由 sendApprovalSignal 模拟外部系统（审批回调）在工作流挂起期间批准请求。
+	go sendApprovalSignal(e, logger, runID)
 
-	// 4. 轮询结果（生产环境可用事件 / 回调替代轮询）。
+	// 5. 轮询结果（生产环境可用事件 / 回调替代轮询）。
 	result, err := wait(context.Background(), e, runID, 5*time.Second)
 	if err != nil {
-		log.Fatal(err)
+		logger.Log(slog.LevelError, "wait result failed", slog.Any("error", err))
+		os.Exit(1)
 	}
 
 	fmt.Printf("status: %s\n", result.Status)
@@ -64,10 +71,11 @@ func main() {
 		fmt.Printf("error:  %s\n", result.Err)
 	}
 
-	// 5. 读取该实例的全部日志（journal）并打印。
+	// 6. 读取该实例的全部日志（journal）并打印。
 	logs, err := readJournal(context.Background(), store, runID)
 	if err != nil {
-		log.Fatal(err)
+		logger.Log(slog.LevelError, "read journal failed", slog.Any("error", err))
+		os.Exit(1)
 	}
 	fmt.Println("journal:")
 	for i, l := range logs {
@@ -76,6 +84,19 @@ func main() {
 			label = "-"
 		}
 		fmt.Printf("  %02d. kind=%s label=%s payload=%s\n", i+1, l.Kind, label, string(l.Payload))
+	}
+}
+
+// sendApprovalSignal 演示引擎的 Signal API：向挂起的实例投递信号并触发恢复。
+//
+// 真实场景中信号来自外部系统（审批回调、Webhook、消息队列消费者）——
+// Signal 是引擎的入站 API。这里在短暂延迟后投递，模拟「工作流 Await 挂起
+// 期间，外部审批系统批准了该请求」。
+func sendApprovalSignal(e *engine.Engine, logger observ.Logger, runID model.RunID) {
+	time.Sleep(100 * time.Millisecond)
+	fmt.Println("sending signal: approved")
+	if err := e.Signal(context.Background(), runID, "approved", map[string]string{"by": "ops"}); err != nil {
+		logger.Log(slog.LevelWarn, "signal error", slog.Any("error", err))
 	}
 }
 

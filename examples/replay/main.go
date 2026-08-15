@@ -14,8 +14,11 @@ package main
 import (
 	"context"
 	"fmt"
+	"log/slog"
+	"os"
 	"sync/atomic"
 
+	"github.com/jninng/observ"
 	"github.com/jninng/track/clock"
 	"github.com/jninng/track/engine"
 	"github.com/jninng/track/infra/memory"
@@ -37,8 +40,12 @@ func main() {
 
 	// 装配引擎：内存后端 + 同步执行模式。RunSync 让 Start/RunOnce 同步完成，
 	// 便于在单进程内精确控制每一步；NoAutoRecover 避免自动扫描干扰演示。
+	// 引擎内部日志经 observ.Logger 输出：桥接 slog 到 stderr 并开启 Debug 级，
+	// 让「挂起恢复即重放」的 run replaying 钩子在本演示中可见。
+	logger := observ.NewSlogLogger(slog.New(slog.NewTextHandler(os.Stderr,
+		&slog.HandlerOptions{Level: slog.LevelDebug})))
 	s := memory.New()
-	e := engine.NewEngine(s, engine.WithClock(clock.RealClock{}))
+	e := engine.NewEngine(s, engine.WithClock(clock.RealClock{}), engine.WithLogger(logger))
 	e.SetTestOptions(engine.TestOptions{RunSync: true, NoAutoRecover: true})
 	defer e.Stop(context.Background())
 
@@ -52,11 +59,14 @@ func main() {
 	fmt.Println()
 
 	// ---- 第 1 阶段：首次执行（录制 journal）----
+	// 阶段标记经同一 logger 输出（与引擎日志同流、时序交错）：
+	// 紧跟其后的 run started / run completed 即本阶段触发的那一次 run。
 	fmt.Println("=== 第 1 阶段：首次执行（录制 journal）===")
 	rid, err := e.Start(ctx, "ReplayWorkflow", nil)
 	if err != nil {
 		panic(err)
 	}
+	fmt.Printf("  run_id：%s\n", rid)
 	first := mustResult(ctx, e, rid)
 	golden := mustJournal(ctx, s, rid)
 

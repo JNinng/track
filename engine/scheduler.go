@@ -2,19 +2,20 @@ package engine
 
 import (
 	"context"
-	"log"
+	"log/slog"
 	"sync"
 	"time"
 
+	"github.com/jninng/observ"
 	"github.com/jninng/track/model"
 )
 
 // scheduler 实现 Worker Pool 与 TaskQueue（设计文档第 8 节）。
 //
 // TaskQueue 是带缓冲的 channel，作为仅存于内存的快速通道。固定数量的
-// Worker 从中消费 RunID 并调用引擎的 run 逻辑。
+// Worker 从中消费任务并调用引擎的 run 逻辑。
 type scheduler struct {
-	queue    chan model.RunID
+	queue    chan task
 	wg       sync.WaitGroup
 	once     sync.Once
 	stopped  bool
@@ -25,6 +26,12 @@ type scheduler struct {
 	timers   map[model.RunID]context.CancelFunc // 活跃的唤醒定时器取消句柄
 }
 
+// task 是队列元素：RunID 及其投递来源（纯观测元数据，随日志输出）。
+type task struct {
+	runID  model.RunID
+	source string
+}
+
 func newScheduler(e *Engine, workers, queueSize int) *scheduler {
 	if workers <= 0 {
 		workers = defaultWorkers
@@ -33,7 +40,7 @@ func newScheduler(e *Engine, workers, queueSize int) *scheduler {
 		queueSize = workers * 4
 	}
 	return &scheduler{
-		queue:   make(chan model.RunID, queueSize),
+		queue:   make(chan task, queueSize),
 		engine:  e,
 		workers: workers,
 		timers:  make(map[model.RunID]context.CancelFunc),
@@ -51,17 +58,17 @@ func (s *scheduler) start() {
 // worker 消费队列并执行 run 逻辑。
 func (s *scheduler) worker() {
 	defer s.wg.Done()
-	for runID := range s.queue {
-		s.engine.run(s.engine.ctx, runID)
+	for t := range s.queue {
+		s.engine.run(s.engine.ctx, t.runID, t.source)
 	}
 }
 
-// enqueue 将 RunID 推入队列。队列满时丢弃并记录日志（应通过增大队列避免）。
+// enqueue 将任务推入队列。队列满时丢弃并记录日志（应通过增大队列避免）。
 //
 // 注意：检查 stopped 标志与向 queue 发送必须在同一把 stopMu 临界区内完成，
 // 否则 stop() 可能在二者之间 close(s.queue)，导致本方法向已关闭的 channel
 // 发送而 panic。
-func (s *scheduler) enqueue(runID model.RunID) {
+func (s *scheduler) enqueue(runID model.RunID, source string) {
 	s.stopMu.Lock()
 	defer s.stopMu.Unlock()
 	if s.stopped {
@@ -73,9 +80,10 @@ func (s *scheduler) enqueue(runID model.RunID) {
 
 	// 非阻塞发送：队列满时丢弃而非死锁；持锁安全。
 	select {
-	case s.queue <- runID:
+	case s.queue <- task{runID: runID, source: source}:
 	default:
-		log.Printf("engine: task queue full, dropping run %s", runID)
+		logWith(s.engine.logger, slog.LevelWarn, "engine: task queue full, dropping run",
+			slog.String(observ.AttrRunID, string(runID)))
 	}
 }
 
@@ -92,12 +100,22 @@ func (s *scheduler) scheduleWakeup(runID model.RunID, deadline time.Time) {
 	if deadline.IsZero() {
 		return
 	}
+	// 唤醒调度是确定性关键路径（deadline 锚定）：注册前记录一次（Debug，门控）。
+	if s.engine.logger.Enabled(slog.LevelDebug) {
+		logWith(s.engine.logger, slog.LevelDebug, "engine: wakeup scheduled",
+			slog.String(observ.AttrRunID, string(runID)),
+			slog.Time("deadline", deadline))
+	}
 	remaining := deadline.Sub(s.engine.clock.Now())
 	if remaining <= 0 {
 		// 已到期：立即重投。经 goroutine 异步执行——RunSync 模式下当前 run
 		// 仍持有锁，同步重入会因 Acquire 失败而丢失本次唤醒；异步也与
 		// 定时器触发路径（goroutine 内 dispatch）保持一致。
-		go s.engine.dispatch(runID)
+		if s.engine.logger.Enabled(slog.LevelDebug) {
+			logWith(s.engine.logger, slog.LevelDebug, "engine: wakeup fired",
+				slog.String(observ.AttrRunID, string(runID)))
+		}
+		go s.engine.dispatch(runID, srcTimer)
 		return
 	}
 
@@ -109,7 +127,11 @@ func (s *scheduler) scheduleWakeup(runID model.RunID, deadline time.Time) {
 		defer s.clearTimer(runID)
 		select {
 		case <-timerCh:
-			s.engine.dispatch(runID)
+			if s.engine.logger.Enabled(slog.LevelDebug) {
+				logWith(s.engine.logger, slog.LevelDebug, "engine: wakeup fired",
+					slog.String(observ.AttrRunID, string(runID)))
+			}
+			s.engine.dispatch(runID, srcTimer)
 		case <-ctx.Done():
 		}
 	}()
