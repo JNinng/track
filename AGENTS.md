@@ -33,7 +33,11 @@ store/     storage INTERFACES only: Reader/Writer/Mailbox/Locker/Meta, aggregate
 infra/memory/   in-memory implementation (tests); New()/NewLocker()/NewMailbox()
 clock/     Clock interface + RealClock / FakeClock
 policy/    RetryPolicy interface + NoRetry/FixedDelay/ExponentialBackoff
-examples/  hello_workflow.go end-to-end demo
+examples/  hello_workflow.go end-to-end demo;
+           examples/replay determinism replay demo;
+           examples/observability SEPARATE module (own go.mod, replace to root)
+           wiring observ.Logger(slog) + observ.Meter(prom adapter) — keeps the
+           prometheus dep tree out of the root module
 docs/track.md   the contract
 ```
 
