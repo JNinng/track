@@ -31,6 +31,13 @@ var (
 	// 历史日志发生变更，继续重放会破坏幂等性与确定性，故以失败显式暴露，而非静默腐化。
 	// 提升工作流版本（WithVersion）可主动声明破坏性变更。
 	ErrJournalMismatch = errors.New("workflow: journal mismatch on replay")
+
+	// ErrRunNotFailed 表示 Retry 的目标实例不处于 Failed 终态，拒绝重置。
+	//
+	// Retry 仅接受 Failed 实例（见 Engine.Retry）；Succeeded/Cancelled 终态与
+	// Running/Awaiting 非终态均返回本错误。与 ErrWorkflowNotFound 同属 API 级
+	// 校验错误，不提供 IsXxx 辅助（调用方直接 errors.Is 判定）。
+	ErrRunNotFailed = errors.New("workflow: run is not in failed state")
 )
 
 // 以下 IsXxx 辅助函数供业务代码判断原语产生的哨兵错误（支持 errors.Is 包装）。

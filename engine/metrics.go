@@ -74,6 +74,7 @@ func newMetrics(m observ.Meter) *metrics {
 		srcSignal:  m.NewCounter("track_dispatch_signal_total", "Signal 唤醒触发的分发次数"),
 		srcTimer:   m.NewCounter("track_dispatch_timer_total", "唤醒定时器触发的分发次数"),
 		srcRecover: m.NewCounter("track_dispatch_recover_total", "Recover 扫描触发的分发次数"),
+		srcRetry:   m.NewCounter("track_dispatch_retry_total", "Retry API 触发的分发次数"),
 		srcManual:  m.NewCounter("track_dispatch_manual_total", "手动/测试触发的分发次数"),
 	}
 	return mx

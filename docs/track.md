@@ -227,6 +227,8 @@ func (e *Engine) Register(name string, fn WorkflowFunc, opts ...RegisterOption) 
 func (e *Engine) Start(ctx context.Context, name string, input any) (RunID, error)
 // Signal 向挂起的实例发送信号，触发恢复。signal 为信号标识。
 func (e *Engine) Signal(ctx context.Context, runID RunID, signal Signal, payload any) error
+// Retry 重置一个 Failed 终态实例并重新投递执行（从失败点续跑，见下文契约）。
+func (e *Engine) Retry(ctx context.Context, runID RunID) error
 // GetResult 查询运行结果。
 func (e *Engine) GetResult(ctx context.Context, runID RunID) (*RunMeta, error)
 // Recover 手动扫描存储中 Running/Awaiting 的实例，重新推入队列恢复执行。
@@ -265,6 +267,21 @@ func WithMeter(m observ.Meter) EngineOption
 2. **实例已终态**（Succeeded / Failed / Cancelled）：视为 no-op，返回 `nil`（信号对终态实例
    无意义，不持久化、不唤醒）。
 3. **实例非终态**：持久化信号后投递队列唤醒。`payload` 为 `nil` 时存空载荷（仍是合法信号）。
+
+**`Retry` 的终态重置契约**：`Retry` 将一个 `Failed` 终态实例重置回调度并重新投递，必须满足——
+1. **仅 Failed 可重试**：实例不存在返回 `ErrNotFound`；其余任何状态（Succeeded / Cancelled 终态，
+   Running / Awaiting 非终态）返回 `ErrRunNotFailed`，且不得改变实例状态。
+2. **原子「重置 + 投递」**：通过校验后将状态重置为 `StatusRunning`、清空终态字段（`Err`/`Output`），
+   随后**立即**投递队列。重置与投递之间不存在脱离引擎调度的中间窗口；此后周期 `Recover` 再扫描到
+   该实例属正常兜底（锁互斥保证不会双跑）——若重置后投递前崩溃，实例保持 `Running`，由 `Recover`
+   恢复，与崩溃语义一致。
+3. **journal 原样保留，从失败点续跑**：已成功步骤按位置命中历史跳过（零副作用）；失败步骤因
+   「Execute 只记录成功」（6.2）无日志，将被真正重新执行。`Retry` 因此**不是**从头重跑。
+4. **守卫照常生效**：版本校验（7.2 第 4 步）与日志发散检测在 Retry 路径不变——版本相对录制时已
+   变更的实例重试后仍以 `ErrVersionMismatch` 失败。
+5. **不更换输入、不清空 journal**：想「从头重新执行」（尤其需要更换输入）应 `Start` 新实例，旧实例
+   留作审计。清空 journal 复用 RunID 会销毁重放真相源，违反日志不可变契约；Succeeded 实例即使强行
+   重置，重放也会命中全部历史条目、复现同一输出，无重跑意义，故不允许 Retry。
 
 **`Stop` 的关闭超时契约**：`Stop` 必须以传入的 `ctx` 控制关闭的最长等待时间。引擎先取消内部
 context 以通知所有 Worker，再等待 Worker 退出；若业务 `fn` 忽略传入的 context 而持续阻塞，
@@ -516,6 +533,7 @@ type Clock interface {
 | `ErrReturn`           | 立即终止并返回结果                      | `Return`                         |
 | `ErrVersionMismatch`  | 重放时代码版本与历史不一致，拒绝执行             | runner 版本校验                      |
 | `ErrWorkflowNotFound` | 引用了未注册的工作流名称                   | runner `lookup`                  |
+| `ErrRunNotFailed`     | Retry 目标不处于 Failed 终态，拒绝重置          | Retry 终态校验                      |
 | `ErrJournalMismatch`  | 位置消费 Kind 不符，或终态有残余条目（代码与历史发散） | `consume` / 终态发散守卫 |
 
 业务代码可用配套的 `IsXxx(err)` 辅助函数判定（均基于 `errors.Is`，支持错误包装）：

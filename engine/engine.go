@@ -187,6 +187,43 @@ func (e *Engine) Signal(ctx context.Context, runID model.RunID, signal model.Sig
 	return nil
 }
 
+// Retry 重置一个 Failed 终态实例并重新投递执行（设计文档 5.1 节）。
+//
+// 仅接受 Failed 终态：实例不存在透传存储的 ErrNotFound；其余状态（含
+// Succeeded/Cancelled 终态与 Running/Awaiting 非终态）返回 ErrRunNotFailed。
+// 通过校验后原子地完成「重置 + 投递」：状态重置为 StatusRunning 并清空终态
+// 字段（Err/Output），随后立即投递执行——调用返回时任务已进入调度，不存在
+// 脱离引擎控制的中间窗口；此后周期 Recover 再扫描到该实例也只是正常兜底
+// （锁互斥保证不会双跑）。
+//
+// journal 原样保留：已成功的步骤按位置命中历史跳过（零副作用），失败的步骤
+// 因「Execute 只记录成功」无日志、将被真正重新执行，故 Retry 天然是「从失败
+// 点续跑」而非从头重跑。版本校验照常生效：代码版本相对录制时已变更的实例
+// 会再次以 ErrVersionMismatch 失败，不会静默用新代码重放旧日志。
+//
+// 想「从头重新执行」（尤其需要更换输入）应 Start 新实例，旧实例留作审计：
+// 复用 RunID 清空 journal 会销毁重放真相源，违反日志不可变契约；Succeeded
+// 实例即使强行重置，重放也会命中全部历史条目、复现同一输出，无重跑意义。
+func (e *Engine) Retry(ctx context.Context, runID model.RunID) error {
+	m, err := e.store.GetResult(ctx, runID)
+	if err != nil {
+		return err
+	}
+	if m.Status != model.StatusFailed {
+		return ErrRunNotFailed
+	}
+	if err := e.store.UpdateStatus(ctx, runID, model.StatusRunning,
+		store.WithErr(""), store.WithOutput(nil)); err != nil {
+		return err
+	}
+	// API 事件：终态重置完成、任务重新进入调度（低频）。
+	logWith(e.logger, slog.LevelInfo, "engine: run retried",
+		slog.String(observ.AttrRunID, string(runID)),
+		slog.String(observ.AttrWorkflow, m.Name))
+	e.dispatch(runID, srcRetry)
+	return nil
+}
+
 // GetResult 查询运行结果。
 func (e *Engine) GetResult(ctx context.Context, runID model.RunID) (*model.RunMeta, error) {
 	return e.store.GetResult(ctx, runID)
@@ -283,6 +320,7 @@ const (
 	srcSignal  = "signal"  // Signal API 投递信号后的唤醒投递
 	srcTimer   = "timer"   // 唤醒定时器到期（sleep/await deadline）
 	srcRecover = "recover" // Recover 扫描（首次自动 + 周期兜底）
+	srcRetry   = "retry"   // Retry API 重置 Failed 终态后的重新投递
 	srcManual  = "manual"  // RunOnce 手动/测试触发
 )
 
