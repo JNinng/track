@@ -14,7 +14,7 @@ import (
 
 // run 是单个 RunID 的核心处理流程（设计文档 7.2 节）。
 //
-// source 标识触发本次执行的来源（start/signal/timer/recover/manual），
+// source 标识触发本次执行的来源（start/signal/timer/recover/retry/manual），
 // 纯观测元数据：只进日志，不落盘、不参与重放匹配。
 //
 // 流程：

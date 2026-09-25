@@ -13,8 +13,8 @@ type LogEntry struct {
 	Kind EntryKind
 	// Label 是可选的人类可读标签，仅供调试/日志可读性。
 	//
-	// 重要：Label 绝不参与重放匹配或身份判定——修改 Label 是 cosmetic 变更，
-	// 不会破坏既有日志的重放（这正是相比旧行号 StepID 机制的核心优势）。
+	// 重要：Label 绝不参与重放匹配或身份判定——条目身份只由「位置 + Kind」
+	// 决定（设计文档 6.6 节），修改 Label 是 cosmetic 变更，不会破坏既有日志的重放。
 	Label string
 	// Payload 序列化的执行结果（JSON）。
 	Payload []byte

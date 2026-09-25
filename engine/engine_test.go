@@ -279,7 +279,7 @@ func TestJournalMismatchOnNilReturnLeftover(t *testing.T) {
 // Label 是纯可读元数据：重放只按位置 + Kind 匹配。即使当前代码使用了
 // 与历史不同的 Label，重放仍命中历史条目、不重新执行、不改写已落盘的 Label。
 //
-// 这是位置日志相比旧行号 StepID 的核心收益：cosmetic 变更不破坏既有重放。
+// 这是位置日志的核心收益：cosmetic 变更（如改 Label）不破坏既有重放。
 func TestLabelIsCosmeticAcrossReplay(t *testing.T) {
 	clk := clock.NewFakeClock()
 	e, s := newSyncEngine(t, clk)

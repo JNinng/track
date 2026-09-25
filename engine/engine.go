@@ -49,7 +49,8 @@ type Engine struct {
 	testOpts    testOptions
 }
 
-// NewEngine 创建并启动引擎。store 为 nil 时使用内存后端需由调用方保证非空。
+// NewEngine 创建并启动引擎。store 不能为 nil：引擎不提供缺省后端，
+// 测试与演示可传入 infra/memory.New()。
 func NewEngine(s store.Interface, opts ...EngineOption) *Engine {
 	ctx, cancel := context.WithCancel(context.Background())
 	e := &Engine{
