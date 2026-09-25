@@ -49,7 +49,7 @@ func main() {
 		log.Fatal(err)
 	}
 
-	// 4. 查询结果。
+	// 4. 查询结果（Start 异步执行；实际使用应轮询至终态，见 examples/hello_workflow.go）。
 	result, err := e.GetResult(context.Background(), runID)
 	if err != nil {
 		log.Fatal(err)
@@ -101,12 +101,13 @@ func HelloWorkflow(wf *engine.WorkflowContext) error {
 e.Register(name, fn, opts...)          // 注册工作流（WithVersion 声明破坏性变更）
 e.Start(ctx, name, input) (runID, err) // 启动新实例（异步入队执行）
 e.Signal(ctx, runID, signal, payload)  // 向挂起实例发送信号，触发恢复
+e.Retry(ctx, runID) error              // 重置 Failed 终态实例，从失败点续跑
 e.GetResult(ctx, runID) (*RunMeta, err)// 查询运行结果
 e.Recover(ctx) error                   // 手动扫描存储，恢复崩溃遗留的实例
 e.Stop(ctx) error                      // 优雅关闭（ctx 控制最长等待时间）
 ```
 
-引擎配置：`WithClock`（注入 `FakeClock` 用于测试）、`WithWorkers`（Worker 数，默认 8）、`WithQueueSize`（队列容量，默认 workers×4）、`WithRecoverInterval`（周期性后台兜底扫描间隔，默认 30s）。
+引擎配置：`WithClock`（注入 `FakeClock` 用于测试）、`WithWorkers`（Worker 数，默认 8）、`WithQueueSize`（队列容量，默认 workers×4）、`WithRecoverInterval`（周期性后台兜底扫描间隔，默认 30s）。观测出口经 `WithLogger` / `WithMeter` 注入（缺省零输出零开销），见 [`examples/observability`](examples/observability)。
 
 ## 运行与测试
 
@@ -125,12 +126,13 @@ store/           存储抽象层（接口定义）：Reader/Writer/Mailbox/Locke
 infra/memory/    内存实现（用于测试）
 clock/           时间抽象：RealClock / FakeClock
 policy/          重试策略：NoRetry / FixedDelay / ExponentialBackoff
-examples/        端到端示例
-docs/track.md    设计契约文档
+examples/        端到端示例（examples/observability 为独立模块：观测接入演示）
+docs/track.md    设计契约文档（规范性）
+docs/engine.md   运行机制文档（描述性，与契约互补）
 ```
 
 引擎只依赖 [`store`](store/store.go) 定义的接口，不依赖任何具体存储。接入新后端（如 MySQL / Redis）只需实现 `store.Interface`。
 
 ## 设计文档
 
-完整的组件契约、重放规约、并发与调度模型、测试约束等见 **[docs/track.md](docs/track.md)**。它是修改核心代码前的必读文档，源码注释中以"设计文档第 N 节"的形式交叉引用。
+完整的组件契约、重放规约、并发与调度模型、测试约束等见 **[docs/track.md](docs/track.md)**。它是修改核心代码前的必读文档，源码注释中以"设计文档第 N 节"的形式交叉引用。[docs/engine.md](docs/engine.md) 则从「运行视图」描述引擎当前实际如何运转（组件、数据流、运行循环、调度与恢复），与契约互补阅读。

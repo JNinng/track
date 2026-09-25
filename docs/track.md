@@ -576,7 +576,9 @@ type Cloner interface {
 │   ├── runner.go            # 核心运行循环逻辑，处理重放、状态转换 (对应第 7.2 节)
 │   ├── scheduler.go         # Worker Pool 与 TaskQueue 实现 (对应第 8 节)
 │   ├── errors.go            # 定义哨兵错误 (ErrSleeping, ErrAwaiting, ErrReturn)
+│   ├── metrics.go           # observ.Meter 指标句柄与埋点（观测纯旁路）
 │   ├── options.go           # ExecutionConfig 与 Option 模式 (对应第 3.4 节)
+│   ├── testing.go           # TestOptions / SetTestOptions / RunOnce 测试钩子
 │   └── workflow.go          # WorkflowFunc 类型定义，注册表逻辑
 ├── model/                   # 核心领域模型与基础类型
 │   ├── types.go             # EntryKind, RunID, Signal 等命名类型 (对应第 3.1 节)
@@ -597,7 +599,9 @@ type Cloner interface {
 │   └── retry.go             # RetryPolicy 接口与基础实现 (对应第 10 节)
 ├── examples/                # 使用示例
 │   ├── hello_workflow.go    # 演示如何定义和运行工作流（Input→Execute→Sleep→Await→Return）
-│   └── replay/              # 确定性重放端到端演示（首次录制 → 模拟崩溃 → 重放一致性校验）
+│   ├── replay/              # 确定性重放端到端演示（首次录制 → 模拟崩溃 → 重放一致性校验）
+│   │   └── main.go
+│   └── observability/       # 可观测性接入演示（独立 go.mod 模块，不在契约范围）
 │       └── main.go
 └── go.mod
 ```

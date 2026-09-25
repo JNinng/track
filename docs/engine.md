@@ -2,7 +2,7 @@
 
 > 本文描述 `track` 引擎**实际如何运转**：组件构成、数据流、运行循环、调度与并发、日志驱动重放、状态机与恢复机制。
 > 它是描述性的「运行视图」，与 [`track.md`](./track.md)（规范性的「契约」）互补：契约回答 *必须满足什么*，本文回答 *当前是如何实现的*。
-> 代码引用形如 `engine/runner.go:44`，可与源码对照阅读。
+> 代码引用以「文件 + 符号」形式给出（如 `Engine.run`、`scheduler.enqueue`），不锚定行号，可与源码对照阅读。
 
 ## 1. 全景：分层与依赖方向
 
@@ -21,6 +21,7 @@
 │   runner.go    run() 运行循环 + 状态转换                      │
 │   scheduler.go Worker Pool / TaskQueue / 唤醒定时器          │
 │   errors.go    哨兵错误   options.go  选项   workflow.go 注册 │
+│   metrics.go   指标句柄（observ.Meter）   testing.go 测试钩子 │
 └───────────────────────────▲─────────────────────────────────┘
                             │ 仅依赖接口（store.Interface）
 ┌───────────────────────────┴─────────────────────────────────┐
@@ -63,7 +64,7 @@
 
 ## 3. 引擎生命周期与 API
 
-`NewEngine` 创建即启动：装配存储、注册表、时钟，并启动调度器与周期恢复协程（`engine.go:42`）。
+`NewEngine` 创建即启动：装配存储、注册表、时钟，并启动调度器与周期恢复协程（`engine.NewEngine`）。
 
 ```
 NewEngine(store, opts...)
@@ -74,9 +75,10 @@ NewEngine(store, opts...)
 
 | API | 行为 | 是否阻塞 |
 |---|---|---|
-| `Register(name, fn, opts)` | 注册工作流（同名覆盖），计算默认版本（名称 SHA256 前 8 位） | 否 |
+| `Register(name, fn, opts)` | 注册工作流（同名覆盖），计算默认版本（名称 SHA256 前 8 字节的十六进制） | 否 |
 | `Start(ctx, name, input)` | 写 RunMeta(Running) → 首次自动 Recover 一次 → 投递队列 → 返回 runID | 否（异步执行） |
 | `Signal(ctx, runID, sig, payload)` | 校验非终态 → 持久化信号 → 投递队列唤醒 | 否 |
+| `Retry(ctx, runID)` | 校验 Failed 终态 → 重置为 Running、清空 Err/Output → 投递队列（journal 保留，从失败点续跑） | 否 |
 | `GetResult(ctx, runID)` | 读 RunMeta | 否 |
 | `Recover(ctx)` | 扫描 Running/Awaiting 实例，重新投递 | 否 |
 | `Stop(ctx)` | 取消内部 ctx → 关闭队列 → 等 Worker 退出（至 ctx 到期）→ 取消所有定时器 | 受 ctx 限制 |
@@ -86,24 +88,24 @@ NewEngine(store, opts...)
 ### 4.1 Worker Pool + TaskQueue
 
 ```
-Start/Signal/Recover ──dispatch──► [ TaskQueue (chan, cap=workers*4) ] ──► N 个 Worker
+Start/Signal/Retry/Recover/Timer ──dispatch──► [ TaskQueue (chan, cap=workers*4) ] ──► N 个 Worker
                                          ▲                                    │
                                   enqueue(runID)                          run(ctx, runID)
 ```
 
-- **投递**（`dispatch`，`engine.go:193`）：测试同步模式直接调 `run`；生产走 `sched.enqueue`。
-- **入队**（`enqueue`，`scheduler.go:64`）：在 `stopMu` 临界区内检查 `stopped`、清除该实例既有定时器、**非阻塞发送**。队列满时**静默丢弃并记日志**——任务状态不变（仍 Running/Awaiting），由兜底扫描恢复。
-- **消费**（`worker`，`scheduler.go:52`）：`for runID := range queue { run(...) }`，队列关闭即退出。
+- **投递**（`Engine.dispatch`）：测试同步模式直接调 `run`；生产走 `sched.enqueue`。来源标记为闭合枚举：start/signal/timer/recover/retry/manual（纯观测元数据）。
+- **入队**（`scheduler.enqueue`）：在 `stopMu` 临界区内检查 `stopped`、清除该实例既有定时器、**非阻塞发送**。队列满时**静默丢弃并记日志**——任务状态不变（仍 Running/Awaiting），由兜底扫描恢复。
+- **消费**（`scheduler.worker`）：`for task := range queue { run(...) }`，队列关闭即退出。
 
-> `enqueue` 必须与 `stop` 的 `close(queue)` 互斥（同一把 `stopMu`），否则向已关闭 channel 发送会 panic（`scheduler.go:62` 注释）。
+> `enqueue` 必须与 `stop` 的 `close(queue)` 互斥（同一把 `stopMu`），否则向已关闭 channel 发送会 panic（见两者注释）。
 
 ### 4.2 Locker：单实例串行
 
-`run()` 第一步 `store.Acquire`（`runner.go:24`）。同一 RunID 同一时刻只有一个 Worker 处理；未获取到直接返回。锁基于租约，持有者崩溃后超时可被接管（分布式语义，内存实现默认 30s）。
+`run()` 第一步 `store.Acquire`。同一 RunID 同一时刻只有一个 Worker 处理；未获取到直接返回。锁基于租约，持有者崩溃后超时可被接管（分布式语义，内存实现默认 30s）。
 
 ### 4.3 唤醒定时器：挂起实例的复活
 
-Sleep/Await 挂起后，引擎在 **同步调度阶段** 注册定时器（`scheduler.go:91`），deadline 到达时重新 `dispatch`：
+Sleep/Await 挂起后，引擎在 **同步调度阶段** 注册定时器（`scheduler.scheduleWakeup`），deadline 到达时重新 `dispatch`：
 
 ```
 scheduleWakeup(runID, deadline):
@@ -115,12 +117,13 @@ scheduleWakeup(runID, deadline):
     go { 等 timerCh 或 ctx 取消 → dispatch(runID) }
 ```
 
-> 定时器通道**必须在同步阶段注册**，不能放到后台 goroutine 内——否则 FakeClock 的 `Advance` 可能先于注册发生，deadline 相对已推进时刻重算，破坏确定性（`scheduler.go:88`）。
+> 定时器通道**必须在同步阶段注册**，不能放到后台 goroutine 内——否则 FakeClock 的 `Advance` 可能先于注册发生，deadline 相对已推进时刻重算，破坏确定性（`scheduleWakeup` 注释）。
 > `enqueue` 前会 `clearTimer(runID)`，避免定时器触发与主动投递叠加导致重复入队。
+> 定时器句柄按**代次**登记（`timerHandle` 指针身份）：被取消的旧代次在 goroutine 退出时经 `clearTimerIf` 按指针比较延迟清理，只删自己登记的句柄——防止「取消 → 重新挂起 → 登记新代次」交错后，旧代次误删新代次定时器导致唤醒静默丢失。
 
 ## 5. 运行循环 `run()` 详解
 
-单个 RunID 的核心处理（`runner.go:23`），严格按序：
+单个 RunID 的核心处理（`Engine.run`），严格按序：
 
 ```
 run(ctx, runID)
@@ -136,7 +139,7 @@ run(ctx, runID)
  9. defer Release 锁
 ```
 
-> **`isReplay` 一次性锚定**（`runner.go:76`）：run 开始时由 `len(logs)>0` 决定，不随 journal 增长翻转——业务可据此在重放时跳过可丢弃副作用。
+> **`isReplay` 一次性锚定**（run 第 5 步构建上下文时）：由 `len(logs)>0` 决定，不随 journal 增长翻转——业务可据此在重放时跳过可丢弃副作用。
 
 ## 6. 状态机
 
@@ -151,9 +154,9 @@ run(ctx, runID)
    └────┬─────┘
         │ 其它错误（ctx 未取消）/ 版本不符 / 工作流未注册 / 日志发散
         ▼
-   ┌────────┐
-   │ Failed │ 终态
-   └────────┘
+   ┌────────┐   Retry API（仅 Failed）：重置 Running、清 Err/Output
+   │ Failed │ ──────────────────────────────────────────► 回到 Running
+   └────────┘   （终态；journal 原样保留，从失败点续跑）
    （Cancelled 已定义，但触发 API 不在当前契约范围内）
 
    注：Stop 取消内部 ctx 时，执行中被中断的工作流（非哨兵错误 + ctx.Err()!=nil）
@@ -162,7 +165,7 @@ run(ctx, runID)
 
 终态判定：`StatusSucceeded / StatusFailed / StatusCancelled` 为终态（`IsTerminal`）。`StatusRunning`/`StatusAwaiting` 非终态，可继续变化。
 
-第 8 步 switch（`runner.go:91`）按返回错误映射状态：
+第 8 步 switch 按返回错误映射状态：
 
 | 业务返回 | 处理 | 终态 |
 |---|---|---|
@@ -295,6 +298,8 @@ Await 是最复杂的原语，因为它要同时保证「跨重启确定性」�
 ```
 Await(signal, timeout):
  1. timeout>0: 消费/记录 KindAwaitDeadline（首次计算 clock.Now()+timeout 并持久化）
+    timeout=0: 清零 awaitDeadline（防沿用本 run 更早 Await 的过期值
+               → 立即触发唤醒，挂起-重投-再挂起形成紧忙循环）
  2. 消费已决策结果：
        KindAwait        → 返回历史 payload
        KindAwaitTimeout → 返回 ErrAwaitTimeout（不再查信箱）
@@ -316,15 +321,15 @@ Await(signal, timeout):
 
 | 层 | 触发 | 机制 | 代码 |
 |---|---|---|---|
-| **① 唤醒** | Sleep/Await deadline 到达 | `scheduleWakeup` 定时器触发 `dispatch` | `scheduler.go:91` |
-| **② Recover 扫描** | 三路径：首次 Start 自动、周期 ticker（30s）、手动 `Recover()` | 扫描 `ListByStatus(Running,Awaiting)` → 重新 dispatch | `engine.go:101`、`engine.go:174`、`engine.go:159` |
-| **③ 队列满丢弃兜底** | `enqueue` 满时静默丢弃 | 任务状态保持 Running/Awaiting → 被 ② 扫描恢复 | `scheduler.go:77` |
+| **① 唤醒** | Sleep/Await deadline 到达 | `scheduleWakeup` 定时器触发 `dispatch` | `scheduler.scheduleWakeup` |
+| **② Recover 扫描** | 三路径：首次 Start 自动、周期 ticker（30s）、手动 `Recover()` | 扫描 `ListByStatus(Running,Awaiting)` → 重新 dispatch | `Start`（首次自动）、`recoverLoop`（周期）、`Recover`（手动） |
+| **③ 队列满丢弃兜底** | `enqueue` 满时静默丢弃 | 任务状态保持 Running/Awaiting → 被 ② 扫描恢复 | `scheduler.enqueue` |
 
 被重新调度的实例由原语**幂等地重新评估 deadline**：未到期再次挂起，已到期继续推进，故无须按定时器是否到期过滤。
 
 ## 10. Execute 的重试与超时
 
-`Execute` 在 Timeout/Retry 约束下循环执行 fn（`context.go:148`）：
+`Execute` 在 Timeout/Retry 约束下循环执行 fn（`executeWithPolicy`）：
 
 ```
 retry = policy.ForExec(cfg.Retry)        克隆，隔离状态（Cloner）
@@ -339,7 +344,7 @@ loop:
 ```
 
 - **失败不写日志**：重试耗尽的失败步骤不 `commit`，恢复时重新执行，维持确定性。
-- **重试状态隔离**：状态化策略（FixedDelay/ExponentialBackoff）实现 `Cloner`，每次 Execute 克隆独立副本，避免跨调用/跨实例共享计数（`policy/retry.go:145`）。
+- **重试状态隔离**：状态化策略（FixedDelay/ExponentialBackoff）实现 `Cloner`，每次 Execute 克隆独立副本，避免跨调用/跨实例共享计数（`policy.ForExec`）。
 - **引擎关停不判失败**：入口的 `ctx.Err()` 检查令 Execute 在引擎关停时立即返回 ctx 错误而不白跑
   fn；run 循环据此（`ctx.Err()!=nil`）保持 `Running` 而非判 `Failed`（见 §6），交由重启 Recover 重放。
 
