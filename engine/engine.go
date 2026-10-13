@@ -190,8 +190,12 @@ func (e *Engine) Signal(ctx context.Context, runID model.RunID, signal model.Sig
 
 // Retry 重置一个 Failed 终态实例并重新投递执行（设计文档 5.1 节）。
 //
-// 仅接受 Failed 终态：实例不存在透传存储的 ErrNotFound；其余状态（含
-// Succeeded/Cancelled 终态与 Running/Awaiting 非终态）返回 ErrRunNotFailed。
+// 仅接受 Failed 终态：实例不存在透传存储的 ErrNotFound；锁被正在执行的
+// Worker 持有返回 ErrRunBusy；其余状态（含 Succeeded/Cancelled 终态与
+// Running/Awaiting 非终态）返回 ErrRunNotFailed。
+// 与 Cancel 同款互斥前置：校验与重置必须在 per-run 锁内进行——否则校验读到
+// Failed 之后、覆盖写入之前，Cancel 可恰好落盘 Cancelled 终态，一次已成功的
+// 取消被静默丢弃（重放还会撞上尾部 KindCancel 的发散守卫）。
 // 通过校验后原子地完成「重置 + 投递」：状态重置为 StatusRunning 并清空终态
 // 字段（Err/Output），随后立即投递执行——调用返回时任务已进入调度，不存在
 // 脱离引擎控制的中间窗口；此后周期 Recover 再扫描到该实例也只是正常兜底
@@ -206,22 +210,137 @@ func (e *Engine) Signal(ctx context.Context, runID model.RunID, signal model.Sig
 // 复用 RunID 清空 journal 会销毁重放真相源，违反日志不可变契约；Succeeded
 // 实例即使强行重置，重放也会命中全部历史条目、复现同一输出，无重跑意义。
 func (e *Engine) Retry(ctx context.Context, runID model.RunID) error {
-	m, err := e.store.GetResult(ctx, runID)
+	// 1. 互斥前置：校验与重置在 per-run 锁内进行（与在途 run 及 Cancel 串行化，
+	// 见方法注释）。
+	ok, err := e.store.Acquire(ctx, runID)
 	if err != nil {
 		return err
 	}
-	if m.Status != model.StatusFailed {
-		return ErrRunNotFailed
+	if !ok {
+		return ErrRunBusy
 	}
-	if err := e.store.UpdateStatus(ctx, runID, model.StatusRunning,
-		store.WithErr(""), store.WithOutput(nil)); err != nil {
+
+	// 2. 锁内校验目标：不存在透传 ErrNotFound；非 Failed 拒绝且不改状态。
+	m, err := e.store.GetResult(ctx, runID)
+	if err != nil {
+		e.releaseRunLock(ctx, runID, "retry")
 		return err
 	}
+	if m.Status != model.StatusFailed {
+		e.releaseRunLock(ctx, runID, "retry")
+		return ErrRunNotFailed
+	}
+
+	// 3. 锁内重置：终态字段清空，状态回到 Running。
+	if err := e.store.UpdateStatus(ctx, runID, model.StatusRunning,
+		store.WithErr(""), store.WithOutput(nil)); err != nil {
+		e.releaseRunLock(ctx, runID, "retry")
+		return err
+	}
+	e.releaseRunLock(ctx, runID, "retry")
+
 	// API 事件：终态重置完成、任务重新进入调度（低频）。
 	logWith(e.logger, slog.LevelInfo, "engine: run retried",
 		slog.String(observ.AttrRunID, string(runID)),
 		slog.String(observ.AttrWorkflow, m.Name))
+
+	// 4. 释放锁后再投递：RunSync 模式下 dispatch 同步进入 run()，若仍持锁会
+	// 因 Acquire 失败（内存锁不可重入）丢失本次重投——与 scheduleWakeup 的
+	// 立即重投走异步 goroutine 同理。异步模式下释放与投递之间的窗口由 Recover
+	// 兜底（实例保持 Running，与崩溃语义一致）。
 	e.dispatch(runID, srcRetry)
+	return nil
+}
+
+// releaseRunLock 释放 per-run 锁，失败仅记日志不改变业务状态
+// （与 run 循环的 defer Release 同构）。phase 仅用于日志归属（cancel/retry）。
+func (e *Engine) releaseRunLock(ctx context.Context, runID model.RunID, phase string) {
+	if rerr := e.store.Release(ctx, runID); rerr != nil {
+		logWith(e.logger, slog.LevelWarn, "engine: release lock failed ("+phase+")",
+			slog.String(observ.AttrRunID, string(runID)), slog.Any("error", rerr))
+	}
+}
+
+// Cancel 将一个非终态实例终止为 StatusCancelled（设计文档 5.1 节）。
+//
+// 典型目标是挂起中的实例（Await 等待外部审批、Sleep 长等待）：被拒/主动取消后
+// 立即终止，无需等待超时或信号。语义要点（详见「Cancel 的取消契约」）：
+//
+//   - 实例不存在：透传存储的 ErrNotFound；
+//   - 实例已终态：no-op 返回 nil（重复取消幂等，与 Signal 对终态的处理一致）；
+//   - 实例正在执行（per-run 锁被 Worker 持有）：返回 ErrRunBusy，不改状态不写
+//     日志——引擎不注入 per-run 可取消 context，业务函数无法被外部中断，此时
+//     置终态会被 run 循环随后的 succeed/fail 覆盖；实例挂起后锁已释放可重试；
+//   - 其余非终态：先置 StatusCancelled（决策生效点），再追加 KindCancel 审计
+//     条目；两步之间崩溃只损失审计痕迹，实例保持终态不再被调度。
+//
+// 取消决策写在 journal 尾部之外（被取消实例的日志此后不再被消费），既有条目
+// 的位置与 Kind 不受影响，无需提升工作流版本。
+func (e *Engine) Cancel(ctx context.Context, runID model.RunID, opts ...CancelOption) error {
+	var cfg cancelConfig
+	for _, o := range opts {
+		o(&cfg)
+	}
+
+	// 1. 互斥前置：与在途 run 串行化。锁被持有说明实例正在 Worker 上执行，
+	// 见方法注释——拒绝取消，让调用方重试。
+	ok, err := e.store.Acquire(ctx, runID)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return ErrRunBusy
+	}
+	defer e.releaseRunLock(ctx, runID, "cancel")
+
+	// 2. 锁内校验目标：不存在透传 ErrNotFound；已终态 no-op。校验必须在锁内
+	// 进行，否则与「恰好被唤醒/恢复的 run」存在 TOCTOU 窗口。
+	m, err := e.store.GetResult(ctx, runID)
+	if err != nil {
+		return err
+	}
+	if m.Status.IsTerminal() {
+		if e.logger.Enabled(slog.LevelDebug) {
+			logWith(e.logger, slog.LevelDebug, "engine: cancel ignored, run already terminal",
+				slog.String(observ.AttrRunID, string(runID)),
+				slog.String("status", m.Status.String()))
+		}
+		return nil
+	}
+
+	// 3. 先状态后审计：状态是取消决策的生效点——终态落盘后，任何后续路径
+	// （定时器唤醒、迟到信号、Recover 兜底）都会在 run 循环第 2 步按终态跳过。
+	reason := cfg.reason
+	if reason == "" {
+		reason = "cancelled"
+	}
+	if err := e.store.UpdateStatus(ctx, runID, model.StatusCancelled, store.WithErr(reason)); err != nil {
+		return err
+	}
+
+	// 审计条目（KindCancel，Payload 为原因 JSON）。追加失败仅记日志不回滚：
+	// 终态已生效，取消不可逆；审计缺失可由本条日志事件追溯。
+	var payload []byte
+	if cfg.reason != "" {
+		if pb, merr := json.Marshal(cfg.reason); merr == nil {
+			payload = pb
+		}
+	}
+	if aerr := e.store.Append(ctx, runID, model.LogEntry{Kind: model.KindCancel, Payload: payload}); aerr != nil {
+		logWith(e.logger, slog.LevelWarn, "engine: append cancel journal failed (status already cancelled)",
+			slog.String(observ.AttrRunID, string(runID)), slog.Any("error", aerr))
+	}
+
+	// 4. 清除挂起期间注册的唤醒定时器，避免到期后一次无谓的终态跳过分发；
+	// 与定时器触发竞态时，触发的分发同样在第 2 步按终态跳过，两侧均安全。
+	e.sched.clearTimer(runID)
+
+	e.metrics.runsCancelled.Inc()
+	// API 事件：取消生效（低频），与 run started/completed/failed 构成完整时间线。
+	logWith(e.logger, slog.LevelInfo, "engine: run cancelled",
+		slog.String(observ.AttrRunID, string(runID)),
+		slog.String(observ.AttrWorkflow, m.Name),
+		slog.String("reason", reason))
 	return nil
 }
 

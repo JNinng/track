@@ -46,4 +46,10 @@ const (
 	// 在崩溃恢复重放时发散。是工作流的终态标记——经 Return 结束的实例
 	// 其日志最后一条即 KindReturn。
 	KindReturn EntryKind = "return"
+	// KindCancel 标识 Cancel API 的取消决策记录（终态审计）。
+	//
+	// 由引擎在置 StatusCancelled 之后追加（先状态后审计），Payload 为取消
+	// 原因的 JSON（无原因时为空）。被取消实例是终态、journal 不再被消费，
+	// 本条目位于日志尾部之外、不参与位置重放匹配，仅作终态审计。
+	KindCancel EntryKind = "cancel"
 )

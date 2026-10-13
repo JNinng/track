@@ -117,3 +117,17 @@ type testOptions struct {
 	noAutoRecover bool
 	runSync       bool // Start/run 直接同步执行（不经调度器），便于确定性测试
 }
+
+// CancelOption 用于配置 Cancel API 的可选参数（Option 模式）。
+type CancelOption func(*cancelConfig)
+
+// cancelConfig 汇集 Cancel API 的可选参数。
+type cancelConfig struct {
+	reason string
+}
+
+// WithReason 为取消附加人类可读原因：写入 RunMeta.Err 与 KindCancel 条目的
+// Payload（JSON），供运维排查与审计。缺省时 Err 记录 "cancelled"、Payload 为空。
+func WithReason(reason string) CancelOption {
+	return func(c *cancelConfig) { c.reason = reason }
+}

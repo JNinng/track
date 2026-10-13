@@ -83,6 +83,15 @@ These are easy to break silently. Each is a hard contract in `docs/track.md`:
 - **commit-before-Ack.** `Await` must persist the `KindAwait` decision *before*
   calling `Mailbox.Ack`. An `Ack` failure is non-fatal (orphan signal, leak not
   determinism bug) — never fail the workflow on it.
+- **Cancel is lock-first, status-first, journal-second.** The external `Cancel`
+  API takes the per-run `Locker`, re-checks status under the lock (terminal →
+  no-op), sets `StatusCancelled`, then appends `KindCancel` (audit only — the
+  cancelled instance's journal is never consumed again). It never interrupts an
+  in-flight run: lock held → `ErrRunBusy`, no state change. `Retry` takes the
+  same lock around its Failed-check + reset (releasing before dispatch, since
+  RunSync dispatch re-enters `run()` on the same lock) — both external status
+  writers are serialized; an unlocked Retry could overwrite a just-written
+  Cancelled.
 - **Wakeup deadline is selected by sentinel.** `ErrSleeping`→`sleepDeadline`,
   `ErrAwaiting`→`awaitDeadline`. Do not pick "any nonzero" deadline, or a
   finished Sleep's stale value wakes an Await immediately (busy-loop).
@@ -130,6 +139,6 @@ content (tests use `strings.Contains`).
 
 ## Out of scope (not in this contract)
 
-`infra/redis`, `infra/mysql`, and the `Cancel` primitive / `StatusCancelled`
-trigger API are **not** implemented here. Anything under `infra/` other than
-`memory` must satisfy the §4 store interface contract before wiring into the engine.
+`infra/redis` and `infra/mysql` are **not** implemented here. Anything under
+`infra/` other than `memory` must satisfy the §4 store interface contract before
+wiring into the engine.

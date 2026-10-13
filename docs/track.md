@@ -13,7 +13,7 @@
 
 ## 2. 核心概念
 
-引擎采用**日志驱动**架构。工作流的每一次关键动作（执行步骤、睡眠、等待信号、返回终态结果）都会生成一条不可变的日志记录。
+引擎采用**日志驱动**架构。工作流的每一次关键动作（执行步骤、睡眠、等待信号、返回终态结果、外部取消）都会生成一条不可变的日志记录。
 
 - **位置日志（Positional Journal）**：日志按追加顺序构成有序序列。重放时每个原语**按位置**消费下一条历史记录，身份由“位置 + Kind”决定，不依赖任何字符串键。这是幂等性的基础：若该位置已有匹配 Kind 的记录，则跳过实际执行。
 - **EntryKind**：日志条目的功能类别（exec/sleep/await 等）。重放时引擎据此校验位置上的条目是否与当前原语预期一致，不符即判定为代码与历史发散（`ErrJournalMismatch`）。
@@ -46,6 +46,7 @@ KindAwaitDeadline = "await_deadline"  // Await 原语的超时截止时刻记录
 KindAwait         = "await"           // Await 原语成功消费信号后的载荷记录
 KindAwaitTimeout  = "await_timeout"   // Await 原语持久化的超时决策（重放时复现超时分支）
 KindReturn        = "return"          // Return 原语持久化的终态结果记录（重放时复现输出，确保确定性）
+KindCancel        = "cancel"          // Cancel API 的取消决策记录（终态审计；位于日志尾部之外，不再被重放消费）
 ```
 
 ### 3.2 LogEntry (日志实体)
@@ -228,7 +229,11 @@ func (e *Engine) Start(ctx context.Context, name string, input any) (RunID, erro
 // Signal 向挂起的实例发送信号，触发恢复。signal 为信号标识。
 func (e *Engine) Signal(ctx context.Context, runID RunID, signal Signal, payload any) error
 // Retry 重置一个 Failed 终态实例并重新投递执行（从失败点续跑，见下文契约）。
+// 与 Cancel 同款 per-run 锁互斥：正在执行的实例返回 ErrRunBusy。
 func (e *Engine) Retry(ctx context.Context, runID RunID) error
+// Cancel 终止一个非终态实例为 Cancelled（挂起中的实例可取消；正在执行的
+// 实例返回 ErrRunBusy，见下文契约）。opts 可选 WithReason(reason) 记录取消原因。
+func (e *Engine) Cancel(ctx context.Context, runID RunID, opts ...CancelOption) error
 // GetResult 查询运行结果。
 func (e *Engine) GetResult(ctx context.Context, runID RunID) (*RunMeta, error)
 // Recover 手动扫描存储中 Running/Awaiting 的实例，重新推入队列恢复执行。
@@ -269,10 +274,13 @@ func WithMeter(m observ.Meter) EngineOption
 3. **实例非终态**：持久化信号后投递队列唤醒。`payload` 为 `nil` 时存空载荷（仍是合法信号）。
 
 **`Retry` 的终态重置契约**：`Retry` 将一个 `Failed` 终态实例重置回调度并重新投递，必须满足——
-1. **仅 Failed 可重试**：实例不存在返回 `ErrNotFound`；其余任何状态（Succeeded / Cancelled 终态，
-   Running / Awaiting 非终态）返回 `ErrRunNotFailed`，且不得改变实例状态。
-2. **原子「重置 + 投递」**：通过校验后将状态重置为 `StatusRunning`、清空终态字段（`Err`/`Output`），
-   随后**立即**投递队列。重置与投递之间不存在脱离引擎调度的中间窗口；此后周期 `Recover` 再扫描到
+1. **互斥前置，仅 Failed 可重试**：校验与重置必须先获取该实例的分布式 `Locker`——否则校验读到
+   `Failed` 之后、覆盖写入之前，`Cancel` 可恰好落盘 `Cancelled` 终态，一次已成功的取消被静默
+   丢弃（重放还会撞上尾部 `KindCancel` 的发散守卫）。实例不存在返回 `ErrNotFound`；锁被正在
+   执行的 Worker 持有返回 `ErrRunBusy`；其余任何状态（Succeeded / Cancelled 终态，Running /
+   Awaiting 非终态）返回 `ErrRunNotFailed`，且不得改变实例状态。
+2. **原子「重置 + 投递」**：锁内通过校验后将状态重置为 `StatusRunning`、清空终态字段（`Err`/`Output`），
+   释放锁后**立即**投递队列。重置与投递之间不存在脱离引擎调度的中间窗口；此后周期 `Recover` 再扫描到
    该实例属正常兜底（锁互斥保证不会双跑）——若重置后投递前崩溃，实例保持 `Running`，由 `Recover`
    恢复，与崩溃语义一致。
 3. **journal 原样保留，从失败点续跑**：已成功步骤按位置命中历史跳过（零副作用）；失败步骤因
@@ -282,6 +290,26 @@ func WithMeter(m observ.Meter) EngineOption
 5. **不更换输入、不清空 journal**：想「从头重新执行」（尤其需要更换输入）应 `Start` 新实例，旧实例
    留作审计。清空 journal 复用 RunID 会销毁重放真相源，违反日志不可变契约；Succeeded 实例即使强行
    重置，重放也会命中全部历史条目、复现同一输出，无重跑意义，故不允许 Retry。
+
+**`Cancel` 的取消契约**：`Cancel` 将一个非终态实例终止为 `StatusCancelled`（`Err` 记录取消原因，
+未提供 `WithReason` 时为 `cancelled`），必须满足——
+1. **实例不存在**：返回 `ErrNotFound`，不改动状态、不写日志。
+2. **实例已终态**（Succeeded / Failed / Cancelled）：视为 no-op，返回 `nil`（重复取消幂等）。
+3. **互斥前置**：必须先获取该实例的分布式 `Locker` 再做任何改动——否则与在途 run 竞态，取消写入的
+   终态会被 run 循环的 `succeed`/`fail` 覆盖。锁被持有（实例正在 Worker 上执行）时返回 `ErrRunBusy`，
+   不改动状态、不写日志，调用方可稍后重试（实例挂起后锁已释放）。引擎不注入 per-run 可取消 context，
+   **不中断正在执行的业务函数**：取消语义锚定在挂起点——被取消实例不再被任何路径唤醒，业务代码
+   从挂起点之后不再执行。「锁被持有 ⇔ 正在执行」的等价以 4.3 的租约约束为前提：run 的同步执行
+   时长超过租约时，过期的锁可被取得，取消终态会被仍在执行的 Worker 以 `succeed`/`fail` 覆盖
+   （引擎级既有边界，非 Cancel 特有）。
+4. **先状态后审计**：锁内校验通过后，先将 `RunMeta` 置为 `StatusCancelled`，再追加 `KindCancel`
+   条目（`Payload` 为原因 JSON，无原因时为空）。状态是决策生效点，日志条目是审计痕迹；两步之间
+   崩溃只损失审计条目，实例保持终态、不再被调度，不产生确定性风险。
+5. **不影响既有 journal 的重放语义**：取消决策写在日志尾部之外，被取消实例的 journal 此后不再被
+   消费（终态在 run 循环第 2 步跳过），既有条目的位置与 Kind 不受影响，无需提升工作流版本。
+6. **定时器与迟到信号**：取消成功后清除该实例活跃的唤醒定时器；与定时器触发竞态时，触发的分发在
+   run 循环第 2 步按终态跳过。迟到的 `Signal` 同理被终态校验忽略（no-op），或成为孤儿信号（与 Ack
+   失败同级，不构成确定性缺陷）。
 
 **`Stop` 的关闭超时契约**：`Stop` 必须以传入的 `ctx` 控制关闭的最长等待时间。引擎先取消内部
 context 以通知所有 Worker，再等待 Worker 退出；若业务 `fn` 忽略传入的 context 而持续阻塞，
@@ -534,6 +562,7 @@ type Clock interface {
 | `ErrVersionMismatch`  | 重放时代码版本与历史不一致，拒绝执行             | runner 版本校验                      |
 | `ErrWorkflowNotFound` | 引用了未注册的工作流名称                   | runner `lookup`                  |
 | `ErrRunNotFailed`     | Retry 目标不处于 Failed 终态，拒绝重置          | Retry 终态校验                      |
+| `ErrRunBusy`          | Cancel/Retry 目标正在执行（per-run 锁被持有），拒绝操作 | `Cancel`/`Retry` 锁校验                |
 | `ErrJournalMismatch`  | 位置消费 Kind 不符，或终态有残余条目（代码与历史发散） | `consume` / 终态发散守卫 |
 
 业务代码可用配套的 `IsXxx(err)` 辅助函数判定（均基于 `errors.Is`，支持错误包装）：
@@ -727,8 +756,6 @@ Worker Pool 模式。
 **明确不在本契约范围内的内容**（需自行满足第 4 节的 store 接口契约方可接入）：
 
 - `infra/redis`（分布式 Locker/Mailbox）、`infra/mysql`（持久化 Reader/Writer/Meta）等具体存储适配。
-- `Cancel` 原语 / `StatusCancelled` 的触发 API：`StatusCancelled` 已定义为终态，但设置该状态的引擎 API
-  不在本契约范围内。
 
 ### 13.2 运行方式
 

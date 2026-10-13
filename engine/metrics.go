@@ -26,6 +26,7 @@ type metrics struct {
 	runsFailed      observ.Counter // 业务失败/版本不符/日志发散
 	runsSuspended   observ.Counter // 挂起（sleep 与 await 合计）
 	runsInterrupted observ.Counter // 被关停/存储瞬时故障中断，待 Recover 兜底
+	runsCancelled   observ.Counter // 被 Cancel API 终止为 Cancelled 终态
 
 	// 信号管道：received → consumed 闭环；ignored 为终态 no-op。
 	signalsReceived observ.Counter
@@ -58,6 +59,7 @@ func newMetrics(m observ.Meter) *metrics {
 		runsFailed:      m.NewCounter("track_runs_failed_total", "失败终止的运行实例数"),
 		runsSuspended:   m.NewCounter("track_runs_suspended_total", "挂起（sleep/await）的运行次数"),
 		runsInterrupted: m.NewCounter("track_runs_interrupted_total", "被关停或存储瞬时故障中断、待恢复的运行次数"),
+		runsCancelled:   m.NewCounter("track_runs_cancelled_total", "被 Cancel API 终止的运行实例数"),
 		signalsReceived: m.NewCounter("track_signals_received_total", "Signal API 持久化的信号数"),
 		signalsConsumed: m.NewCounter("track_signals_consumed_total", "被 Await 消费的信号数"),
 		signalsIgnored:  m.NewCounter("track_signals_ignored_total", "投递到终态实例被忽略的信号数"),

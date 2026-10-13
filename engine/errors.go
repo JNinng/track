@@ -38,6 +38,16 @@ var (
 	// Running/Awaiting 非终态均返回本错误。与 ErrWorkflowNotFound 同属 API 级
 	// 校验错误，不提供 IsXxx 辅助（调用方直接 errors.Is 判定）。
 	ErrRunNotFailed = errors.New("workflow: run is not in failed state")
+
+	// ErrRunBusy 表示 Cancel/Retry 的目标实例正在 Worker 上执行（per-run 锁被
+	// 持有），拒绝操作。
+	//
+	// 引擎不注入 per-run 可取消 context，不中断正在执行的业务函数——Cancel 的
+	// 取消语义锚定在挂起点；Retry 的校验与重置同理须与在途 run 及 Cancel 互斥，
+	// 否则过期的 Failed 校验会覆盖刚落盘的 Cancelled 终态。实例随后挂起（或
+	// 终态）即释放锁，调用方可重试。与 ErrRunNotFailed 同属 API 级校验错误，
+	// 不提供 IsXxx 辅助（调用方直接 errors.Is 判定）。
+	ErrRunBusy = errors.New("workflow: run is actively executing")
 )
 
 // 以下 IsXxx 辅助函数供业务代码判断原语产生的哨兵错误（支持 errors.Is 包装）。

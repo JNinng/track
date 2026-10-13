@@ -47,7 +47,7 @@
 
 > 职责分离：journal 记「每一步怎么走」，RunMeta 记「整体到哪了」。「是否需要处理」只看 `RunMeta.Status`，不看 journal；崩溃窗口的短暂不一致由重放收敛（§7.4）。
 
-### LogEntry 的六种 Kind
+### LogEntry 的七种 Kind
 
 身份 = 「位置 + Kind」。重放按位置逐条消费、以 Kind 校验一致性；Label 是纯元数据，绝不参与匹配。
 
@@ -59,8 +59,11 @@
 | `KindAwait` | Await 成功消费信号 | 信号 payload | `Await` | Fetch 命中后 |
 | `KindAwaitTimeout` | Await 超时决策 | 空 | `Await` | 信箱空且超时 |
 | `KindReturn` | Return 终态结果 | 输出 JSON | `Return` | 业务调用 Return |
+| `KindCancel` | Cancel 取消决策 | 原因 JSON（无原因为空） | `Engine.Cancel` | 置 Cancelled 终态之后 |
 
 > `KindExec`/`KindReturn` 只记成功/终态值，失败不写日志（失败步骤恢复时重新执行，维持确定性）。
+> `KindCancel` 是唯一由引擎（而非业务原语）写入的条目：被取消实例是终态、journal 不再被消费，
+> 故该条目位于日志尾部之外、不参与位置重放匹配，仅作终态审计（§6 状态机）。
 
 ## 3. 引擎生命周期与 API
 
@@ -78,7 +81,8 @@ NewEngine(store, opts...)
 | `Register(name, fn, opts)` | 注册工作流（同名覆盖），计算默认版本（名称 SHA256 前 8 字节的十六进制） | 否 |
 | `Start(ctx, name, input)` | 写 RunMeta(Running) → 首次自动 Recover 一次 → 投递队列 → 返回 runID | 否（异步执行） |
 | `Signal(ctx, runID, sig, payload)` | 校验非终态 → 持久化信号 → 投递队列唤醒 | 否 |
-| `Retry(ctx, runID)` | 校验 Failed 终态 → 重置为 Running、清空 Err/Output → 投递队列（journal 保留，从失败点续跑） | 否 |
+| `Retry(ctx, runID)` | 取 per-run 锁 → 锁内校验 Failed 终态（执行中返回 ErrRunBusy）→ 重置为 Running、清空 Err/Output → 释放锁后投递队列（journal 保留，从失败点续跑） | 否 |
+| `Cancel(ctx, runID, opts...)` | 取 per-run 锁 → 锁内校验非终态（终态 no-op）→ 先置 Cancelled、再追加 KindCancel → 清唤醒定时器；锁被持有返回 ErrRunBusy | 否 |
 | `GetResult(ctx, runID)` | 读 RunMeta | 否 |
 | `Recover(ctx)` | 扫描 Running/Awaiting 实例，重新投递 | 否 |
 | `Stop(ctx)` | 取消内部 ctx → 关闭队列 → 等 Worker 退出（至 ctx 到期）→ 取消所有定时器 | 受 ctx 限制 |
@@ -157,7 +161,13 @@ run(ctx, runID)
    ┌────────┐   Retry API（仅 Failed）：重置 Running、清 Err/Output
    │ Failed │ ──────────────────────────────────────────► 回到 Running
    └────────┘   （终态；journal 原样保留，从失败点续跑）
-   （Cancelled 已定义，但触发 API 不在当前契约范围内）
+
+   非终态（Running / Awaiting）── Cancel API ──► ┌───────────┐
+                                                │ Cancelled │ 终态
+                                                └───────────┘
+     先置 StatusCancelled 再追加 KindCancel 审计条目（先状态后审计）；
+     正在执行（锁被持有）返回 ErrRunBusy 不改动；成功后清唤醒定时器，
+     journal 尾部的 KindCancel 不再被重放消费
 
    注：Stop 取消内部 ctx 时，执行中被中断的工作流（非哨兵错误 + ctx.Err()!=nil）
        保持 Running——不转入 Failed，交由重启 Recover 重放恢复（见下表）。
