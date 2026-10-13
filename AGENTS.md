@@ -30,8 +30,8 @@ separate `examples/observability` module.
 ```
 engine/    core engine: API (engine.go), primitives (context.go),
            run loop (runner.go), worker pool (scheduler.go),
-           sentinel errors (errors.go), options (options.go),
-           metrics (metrics.go), test hooks (testing.go)
+           waiter registry (waiters.go), sentinel errors (errors.go),
+           options (options.go), metrics (metrics.go), test hooks (testing.go)
 model/     domain types: EntryKind, RunID, Signal, LogEntry, RunMeta/RunStatus
 store/     storage INTERFACES only: Reader/Writer/Mailbox/Locker/Meta, aggregate Interface
 infra/memory/   in-memory implementation (tests); New()/NewLocker()/NewMailbox()

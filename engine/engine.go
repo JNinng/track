@@ -45,6 +45,10 @@ type Engine struct {
 	cancel context.CancelFunc
 	sched  *scheduler
 
+	// waiters 是 WaitDone 的等待者注册表：runID -> channel 列表，纯观测旁路
+	// （不持久化、不参与重放与调度决策）。不变量见 waiterRegistry。
+	waiters *waiterRegistry
+
 	recoverOnce sync.Once
 	testOpts    testOptions
 }
@@ -61,6 +65,7 @@ func NewEngine(s store.Interface, opts ...EngineOption) *Engine {
 		recoverInterval: 30 * time.Second,
 		logger:          observ.DefaultLogger(),
 		metrics:         newMetrics(observ.NoopMeter),
+		waiters:         newWaiterRegistry(),
 		ctx:             ctx,
 		cancel:          cancel,
 	}
@@ -335,6 +340,10 @@ func (e *Engine) Cancel(ctx context.Context, runID model.RunID, opts ...CancelOp
 	// 与定时器触发竞态时，触发的分发同样在第 2 步按终态跳过，两侧均安全。
 	e.sched.clearTimer(runID)
 
+	// 通知放在审计条目与定时器清理之后：WaitDone 返回时终态产物齐备
+	// （元数据 + KindCancel 审计 + 无残留定时器），仍满足「终态落盘后才唤醒」。
+	e.waiters.notify(runID)
+
 	e.metrics.runsCancelled.Inc()
 	// API 事件：取消生效（低频），与 run started/completed/failed 构成完整时间线。
 	logWith(e.logger, slog.LevelInfo, "engine: run cancelled",
@@ -347,6 +356,44 @@ func (e *Engine) Cancel(ctx context.Context, runID model.RunID, opts ...CancelOp
 // GetResult 查询运行结果。
 func (e *Engine) GetResult(ctx context.Context, runID model.RunID) (*model.RunMeta, error) {
 	return e.store.GetResult(ctx, runID)
+}
+
+// WaitDone 阻塞至实例进入终态并返回其 RunMeta（设计文档 5.1 节）。
+//
+// 替代「轮询 GetResult 直至 IsTerminal」的使用方样板。等待者先登记、后查询
+// 终态，不存在错过唤醒的竞态窗口：任何使实例进入终态的引擎路径（run 循环的
+// succeed/fail、Cancel API）都在终态落盘之后才关闭等待者 channel，唤醒后
+// 重新 GetResult 读到的必为终态元数据。
+//
+// 已终态立即返回；实例不存在透传 ErrNotFound。调用方 ctx 取消或引擎 Stop
+// （内部 ctx 关闭）时返回对应 context 错误，等待者登记随之清理不泄漏。
+//
+// 等待者是纯进程内观测旁路：注册表在内存、不持久化、不参与重放，绕过引擎
+// 直接写存储产生的终态转换不在通知范围；引擎从不依据等待者存在与否做调度
+// 或状态决策。
+func (e *Engine) WaitDone(ctx context.Context, runID model.RunID) (*model.RunMeta, error) {
+	ch := make(chan struct{})
+	e.waiters.add(runID, ch)
+	defer e.waiters.remove(runID, ch)
+
+	// 登记后查询：若此刻已终态则直接返回；若非终态，之后的终态转换必然
+	// 经过 waiterRegistry.notify 关闭本 channel，不会错过。
+	m, err := e.store.GetResult(ctx, runID)
+	if err != nil {
+		return nil, err
+	}
+	if m.Status.IsTerminal() {
+		return m, nil
+	}
+	select {
+	case <-ch:
+		return e.store.GetResult(ctx, runID)
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case <-e.ctx.Done():
+		// 引擎关闭：实例可能停在 Running 待重启恢复，等待已无意义。
+		return nil, e.ctx.Err()
+	}
 }
 
 // Stop 优雅关闭引擎，等待 Worker 停止与活跃定时器取消。

@@ -73,7 +73,13 @@ func main() {
 		}
 	}()
 
-	meta := waitTerminal(ctx, e, runID, 5*time.Second)
+	// 等待终态：WaitDone 阻塞至实例进入终态并返回 RunMeta（替代轮询）。
+	waitCtx, cancelWait := context.WithTimeout(ctx, 5*time.Second)
+	defer cancelWait()
+	meta, err := e.WaitDone(waitCtx, runID)
+	if err != nil {
+		panic(err)
+	}
 	fmt.Printf("status: %s\n\n", meta.Status)
 
 	// 4. 打印 Prometheus 指标（生产环境改用 promhttp 暴露 /metrics）：
@@ -116,23 +122,5 @@ func printMetrics(reg *prometheus.Registry) {
 		if err := enc.Encode(mf); err != nil {
 			panic(err)
 		}
-	}
-}
-
-// waitTerminal 轮询直到实例进入终态或超时。
-func waitTerminal(ctx context.Context, e *engine.Engine, runID model.RunID, d time.Duration) *model.RunMeta {
-	deadline := time.Now().Add(d)
-	for {
-		m, err := e.GetResult(ctx, runID)
-		if err != nil {
-			panic(err)
-		}
-		if m.Status.IsTerminal() {
-			return m
-		}
-		if time.Now().After(deadline) {
-			panic(fmt.Sprintf("timeout waiting for %s (status=%s)", runID, m.Status))
-		}
-		time.Sleep(20 * time.Millisecond)
 	}
 }

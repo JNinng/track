@@ -84,6 +84,7 @@ NewEngine(store, opts...)
 | `Retry(ctx, runID)` | 取 per-run 锁 → 锁内校验 Failed 终态（执行中返回 ErrRunBusy）→ 重置为 Running、清空 Err/Output → 释放锁后投递队列（journal 保留，从失败点续跑） | 否 |
 | `Cancel(ctx, runID, opts...)` | 取 per-run 锁 → 锁内校验非终态（终态 no-op）→ 先置 Cancelled、再追加 KindCancel → 清唤醒定时器；锁被持有返回 ErrRunBusy | 否 |
 | `GetResult(ctx, runID)` | 读 RunMeta | 否 |
+| `WaitDone(ctx, runID)` | 阻塞至终态（等待者先登记后查询；`succeed`/`fail`/`Cancel` 终态落盘后 close channel 唤醒），返回终态 RunMeta；已终态立即返回；ctx/Stop 解除阻塞（进程内观测旁路，不参与重放） | 是（至终态） |
 | `Recover(ctx)` | 扫描 Running/Awaiting 实例，重新投递 | 否 |
 | `Stop(ctx)` | 取消内部 ctx → 关闭队列 → 等 Worker 退出（至 ctx 到期）→ 取消所有定时器 | 受 ctx 限制 |
 
@@ -173,7 +174,7 @@ run(ctx, runID)
        保持 Running——不转入 Failed，交由重启 Recover 重放恢复（见下表）。
 ```
 
-终态判定：`StatusSucceeded / StatusFailed / StatusCancelled` 为终态（`IsTerminal`）。`StatusRunning`/`StatusAwaiting` 非终态，可继续变化。
+终态判定：`StatusSucceeded / StatusFailed / StatusCancelled` 为终态（`IsTerminal`）。`StatusRunning`/`StatusAwaiting` 非终态，可继续变化。三处终态转换（`succeed`/`fail`/`Cancel`）在状态落盘后同时唤醒 `WaitDone` 的进程内等待者——等待者注册表是纯观测旁路，引擎不依据它做任何调度决策（`waiterRegistry.notify`）。
 
 第 8 步 switch 按返回错误映射状态：
 

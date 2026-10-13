@@ -58,8 +58,11 @@ func main() {
 	// 由 sendApprovalSignal 模拟外部系统（审批回调）在工作流挂起期间批准请求。
 	go sendApprovalSignal(e, logger, runID)
 
-	// 5. 轮询结果（生产环境可用事件 / 回调替代轮询）。
-	result, err := wait(context.Background(), e, runID, 5*time.Second)
+	// 5. 等待终态：WaitDone 阻塞至实例进入终态并返回 RunMeta，
+	// ctx 控制最长等待（超时返回 context.DeadlineExceeded）。
+	waitCtx, cancelWait := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancelWait()
+	result, err := e.WaitDone(waitCtx, runID)
 	if err != nil {
 		logger.Log(slog.LevelError, "wait result failed", slog.Any("error", err))
 		os.Exit(1)
@@ -147,22 +150,4 @@ func HelloWorkflow(wf *engine.WorkflowContext) error {
 
 	// 6.5 Return：立即终止并返回结果。
 	return wf.Return(greeting + " approved by " + approval["by"])
-}
-
-// wait 轮询直到实例进入终态或超时。
-func wait(ctx context.Context, e *engine.Engine, runID model.RunID, d time.Duration) (*model.RunMeta, error) {
-	deadline := time.Now().Add(d)
-	for {
-		m, err := e.GetResult(ctx, runID)
-		if err != nil {
-			return nil, err
-		}
-		if m.Status.IsTerminal() {
-			return m, nil
-		}
-		if time.Now().After(deadline) {
-			return nil, fmt.Errorf("timeout waiting for %s (status=%s)", runID, m.Status)
-		}
-		time.Sleep(20 * time.Millisecond)
-	}
 }

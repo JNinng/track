@@ -236,6 +236,8 @@ func (e *Engine) Retry(ctx context.Context, runID RunID) error
 func (e *Engine) Cancel(ctx context.Context, runID RunID, opts ...CancelOption) error
 // GetResult 查询运行结果。
 func (e *Engine) GetResult(ctx context.Context, runID RunID) (*RunMeta, error)
+// WaitDone 阻塞至实例进入终态，返回其 RunMeta（替代外部轮询，见下文契约）。
+func (e *Engine) WaitDone(ctx context.Context, runID RunID) (*RunMeta, error)
 // Recover 手动扫描存储中 Running/Awaiting 的实例，重新推入队列恢复执行。
 func (e *Engine) Recover(ctx context.Context) error
 // Stop 优雅关闭引擎。
@@ -304,12 +306,23 @@ func WithMeter(m observ.Meter) EngineOption
    （引擎级既有边界，非 Cancel 特有）。
 4. **先状态后审计**：锁内校验通过后，先将 `RunMeta` 置为 `StatusCancelled`，再追加 `KindCancel`
    条目（`Payload` 为原因 JSON，无原因时为空）。状态是决策生效点，日志条目是审计痕迹；两步之间
-   崩溃只损失审计条目，实例保持终态、不再被调度，不产生确定性风险。
+   崩溃只损失审计条目，实例保持终态、不再被调度，不产生确定性风险。`WaitDone` 等待者的唤醒发生在
+   审计条目追加与定时器清理之后——唤醒时终态产物齐备。
 5. **不影响既有 journal 的重放语义**：取消决策写在日志尾部之外，被取消实例的 journal 此后不再被
    消费（终态在 run 循环第 2 步跳过），既有条目的位置与 Kind 不受影响，无需提升工作流版本。
 6. **定时器与迟到信号**：取消成功后清除该实例活跃的唤醒定时器；与定时器触发竞态时，触发的分发在
    run 循环第 2 步按终态跳过。迟到的 `Signal` 同理被终态校验忽略（no-op），或成为孤儿信号（与 Ack
    失败同级，不构成确定性缺陷）。
+
+**`WaitDone` 的等待契约**：`WaitDone` 阻塞至实例进入终态并返回其 `RunMeta`，替代使用方轮询——
+1. **实例不存在**：返回 `ErrNotFound`；**已终态**：立即返回，不阻塞。
+2. **无错过唤醒**：等待者先登记、后查询终态；任何使实例进入终态的引擎路径（run 循环的
+   `succeed`/`fail`、`Cancel` API）都在终态**落盘之后**才唤醒等待者，故唤醒后读到的必为终态元数据。
+3. **纯进程内观测旁路**：等待者注册在引擎内存中，不持久化、不参与重放；绕过引擎直接写存储产生的
+   终态转换不在通知范围。等待与通知不得反向影响执行语义——引擎从不依据等待者存在与否做任何
+   调度或状态决策。
+4. **解除阻塞**：调用方 ctx 取消或引擎 `Stop`（内部 ctx 关闭）时返回对应 context 错误，等待者
+   登记随之清理，不泄漏。
 
 **`Stop` 的关闭超时契约**：`Stop` 必须以传入的 `ctx` 控制关闭的最长等待时间。引擎先取消内部
 context 以通知所有 Worker，再等待 Worker 退出；若业务 `fn` 忽略传入的 context 而持续阻塞，
@@ -604,6 +617,7 @@ type Cloner interface {
 │   ├── context.go           # WorkflowContext 实现，包含 Input, Execute, Sleep, Await 原语 (对应第 6 节)
 │   ├── runner.go            # 核心运行循环逻辑，处理重放、状态转换 (对应第 7.2 节)
 │   ├── scheduler.go         # Worker Pool 与 TaskQueue 实现 (对应第 8 节)
+│   ├── waiters.go           # WaitDone 等待者注册表（进程内，纯观测旁路）
 │   ├── errors.go            # 定义哨兵错误 (ErrSleeping, ErrAwaiting, ErrReturn)
 │   ├── metrics.go           # observ.Meter 指标句柄与埋点（观测纯旁路）
 │   ├── options.go           # ExecutionConfig 与 Option 模式 (对应第 3.4 节)

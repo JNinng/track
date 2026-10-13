@@ -243,6 +243,7 @@ func (e *Engine) succeed(ctx context.Context, runID model.RunID, name string, ou
 			slog.String(observ.AttrRunID, string(runID)), slog.Any("error", err))
 		return
 	}
+	e.waiters.notify(runID)
 	e.metrics.runsSucceeded.Inc()
 	logWith(e.logger, slog.LevelInfo, "engine: run completed",
 		slog.String(observ.AttrRunID, string(runID)),
@@ -257,6 +258,7 @@ func (e *Engine) fail(ctx context.Context, runID model.RunID, name, msg string) 
 			slog.String(observ.AttrRunID, string(runID)), slog.Any("error", err))
 		return
 	}
+	e.waiters.notify(runID)
 	e.metrics.runsFailed.Inc()
 	logWith(e.logger, slog.LevelError, "engine: run failed",
 		slog.String(observ.AttrRunID, string(runID)),
