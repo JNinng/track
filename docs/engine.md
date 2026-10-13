@@ -20,6 +20,7 @@
 │   context.go   WorkflowContext + 原语 + consume/commit        │
 │   runner.go    run() 运行循环 + 状态转换                      │
 │   scheduler.go Worker Pool / TaskQueue / 唤醒定时器          │
+│   waiters.go   WaitDone 等待者注册表（进程内观测旁路）        │
 │   errors.go    哨兵错误   options.go  选项   workflow.go 注册 │
 │   metrics.go   指标句柄（observ.Meter）   testing.go 测试钩子 │
 └───────────────────────────▲─────────────────────────────────┘

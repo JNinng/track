@@ -2,7 +2,7 @@
 
 > 一个**确定性工作流引擎**：日志驱动、崩溃后可完全一致地重放，原生支持长时任务。
 
-`track` 用于解决分布式环境下的长时任务处理问题。工作流的每一次关键动作（执行步骤、睡眠、等待信号）都会生成一条不可变的日志记录；进程崩溃重启后，引擎依据日志**确定性重放**，保证执行逻辑与首次执行完全一致。
+`track` 用于解决分布式环境下的长时任务处理问题。工作流的每一次关键动作（执行步骤、睡眠、等待信号、返回结果、取消）都会生成一条不可变的日志记录；进程崩溃重启后，引擎依据日志**确定性重放**，保证执行逻辑与首次执行完全一致。
 
 ## 核心特性
 
@@ -49,7 +49,7 @@ func main() {
 		log.Fatal(err)
 	}
 
-	// 4. 查询结果（Start 异步执行；实际使用应轮询至终态，见 examples/hello_workflow.go）。
+	// 4. 查询结果（Start 异步执行，此处仅查询一次；实际使用应 WaitDone 阻塞至终态，见 examples/hello_workflow.go）。
 	result, err := e.GetResult(context.Background(), runID)
 	if err != nil {
 		log.Fatal(err)
@@ -102,7 +102,9 @@ e.Register(name, fn, opts...)          // 注册工作流（WithVersion 声明�
 e.Start(ctx, name, input) (runID, err) // 启动新实例（异步入队执行）
 e.Signal(ctx, runID, signal, payload)  // 向挂起实例发送信号，触发恢复
 e.Retry(ctx, runID) error              // 重置 Failed 终态实例，从失败点续跑
+e.Cancel(ctx, runID, opts...) error    // 终止非终态实例为 Cancelled（执行中返回 ErrRunBusy）
 e.GetResult(ctx, runID) (*RunMeta, err)// 查询运行结果
+e.WaitDone(ctx, runID) (*RunMeta, err) // 阻塞至实例终态，替代轮询
 e.Recover(ctx) error                   // 手动扫描存储，恢复崩溃遗留的实例
 e.Stop(ctx) error                      // 优雅关闭（ctx 控制最长等待时间）
 ```
