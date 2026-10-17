@@ -1,15 +1,15 @@
-// Package main 演示 track 引擎的可观测性接入：observ 规范 + Prometheus 出口。
+// Package main 演示 track 引擎的可观测性接入：slog 日志 + OTel 指标（Prometheus 出口）。
 //
 // 运行：cd examples/observability && go run .
 //
 // 本示例展示两个观测通道的统一接线：
 //
-//   - 日志（observ.Logger）：桥接 slog 到 stderr，Debug 级展示引擎完整
+//   - 日志（*slog.Logger）：TextHandler 到 stderr，Debug 级展示引擎完整
 //     生命周期（run dispatched source、run sleeping/awaiting、signal 闭环、
 //     journal_len 等）。
-//   - 指标（observ.Meter）：经 observ/adapters/prom 落到 Prometheus registry，
-//     引擎埋点覆盖分发来源、run 终局、信号闭环、队列水位、journal 追加与
-//     单次 run 耗时。
+//   - 指标（otel metric.Meter）：经 OTel Prometheus exporter 落到 Prometheus
+//     registry，引擎埋点覆盖分发来源、run 终局、信号闭环、队列水位、journal
+//     追加与单次 run 耗时。
 //
 // 生产环境中 registry 通常交给 promhttp 暴露 /metrics 端点（下文注释）；
 // 本示例为可独立运行，跑完一个工作流后直接把指标文本打印到 stdout。
@@ -23,31 +23,44 @@ import (
 	"strings"
 	"time"
 
-	"github.com/jninng/observ"
-	"github.com/jninng/observ/adapters/prom"
 	"github.com/jninng/track/clock"
 	"github.com/jninng/track/engine"
 	"github.com/jninng/track/infra/memory"
 	"github.com/jninng/track/model"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/common/expfmt"
+	otelprom "go.opentelemetry.io/otel/exporters/prometheus"
+	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
 )
 
 func main() {
 	ctx := context.Background()
 
 	// 1. 观测出口装配。
-	// 日志：任意实现 observ.Logger 两方法即可接入；这里桥接 slog（stdlib）。
-	logger := observ.NewSlogLogger(slog.New(slog.NewTextHandler(os.Stderr,
-		&slog.HandlerOptions{Level: slog.LevelDebug})))
+	// 日志：stdlib slog 直接入引擎（WithLogger 接收 *slog.Logger）。
+	logger := slog.New(slog.NewTextHandler(os.Stderr,
+		&slog.HandlerOptions{Level: slog.LevelDebug}))
 
-	// 指标：prom 适配器实现 observ.Meter，New* 即向 registry 注册
-	// （因此引擎在构造期一次性创建全部句柄，符合 observ 规范）。
+	// 指标：OTel Prometheus exporter 兼任 Reader 与 Collector，经
+	// WithRegisterer 注册到 Prometheus registry；引擎在构造期一次性创建全部
+	// 仪表（绑定本 provider）。WithoutUnits 保持指标名原样（
+	// track_run_duration_seconds 已含 _seconds 后缀，不再追加单位后缀）；
+	// WithoutScopeInfo 去掉 otel_scope_* 噪声。
 	reg := prometheus.NewRegistry()
-	meter := prom.New(reg)
+	promExporter, err := otelprom.New(
+		otelprom.WithRegisterer(reg),
+		otelprom.WithoutUnits(),
+		otelprom.WithoutScopeInfo(),
+	)
+	if err != nil {
+		panic(err)
+	}
+	provider := sdkmetric.NewMeterProvider(sdkmetric.WithReader(promExporter))
+	defer func() { _ = provider.Shutdown(ctx) }()
+	meter := provider.Meter("github.com/jninng/track/engine")
 
 	// 2. 装配引擎：内存后端 + 注入两个观测出口。
-	// 未注入时：logger 走包级默认，meter 走 NoopMeter——零输出零开销。
+	// 未注入时：logger 默认 DiscardHandler 静默，meter 默认不埋点——零输出零开销。
 	e := engine.NewEngine(memory.New(),
 		engine.WithClock(clock.RealClock{}),
 		engine.WithLogger(logger),
@@ -69,7 +82,7 @@ func main() {
 	go func() {
 		time.Sleep(150 * time.Millisecond) // 等 Sleep(100ms) 与 Await 先后挂起
 		if err := e.Signal(ctx, runID, "approved", map[string]string{"by": "ops"}); err != nil {
-			logger.Log(slog.LevelWarn, "signal error", slog.Any("error", err))
+			logger.Warn("signal error", "error", err)
 		}
 	}()
 

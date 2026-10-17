@@ -257,15 +257,16 @@ func WithQueueSize(n int) EngineOption
 // 周期扫描作为持久化兜底，重新推入因崩溃遗留或队列满被丢弃（状态保持）的实例。
 // d > 0 启用，d <= 0 禁用；缺省 30s。
 func WithRecoverInterval(d time.Duration) EngineOption
-// WithLogger 注入观测日志出口（observ.Logger 接口，级别复用 slog.Level）。
-// 缺省：NewEngine 构造期读取 observ.DefaultLogger() 并固定（快照语义）——
-// 未设置时为 NoopLogger（零输出），引擎绝不默认向 slog.Default() 写日志；
-// 构造后再替换包级默认不影响已构造的引擎。观测为纯旁路：仅低频生命周期
-// 事件，日志回调 panic 由引擎兜住，不得改变执行语义。
-func WithLogger(l observ.Logger) EngineOption
-// WithMeter 注入指标出口（observ.Meter 接口）。缺省 NoopMeter（零输出零开销）。
-// 指标句柄在构造期一次性创建，热路径只做 Inc/Observe，观测纯旁路。
-func WithMeter(m observ.Meter) EngineOption
+// WithLogger 注入观测日志出口（*slog.Logger，级别复用 slog.Level）。
+// 缺省：引擎默认静默（slog.DiscardHandler，零输出），绝不默认向 slog.Default()
+// 写日志；WithLogger(nil) 与未注入等价。观测为纯旁路：仅低频生命周期
+// 事件，日志回调 panic 由引擎兜住，不得改变执行语义。调用方 ctx 随日志
+// 透传给 Handler，trace 关联由此生效。
+func WithLogger(l *slog.Logger) EngineOption
+// WithMeter 注入指标出口（OTel metric.Meter）。缺省不埋点（meter 为 nil，
+// 零输出零开销）。指标句柄在构造期一次性创建并绑定注入时刻的 Meter/Provider
+// （之后替换全局 Provider 不追溯已建仪表），热路径只做 Add/Record，观测纯旁路。
+func WithMeter(m metric.Meter) EngineOption
 ```
 
 **`Signal` 的目标校验契约**：`Signal` 必须先确认目标实例存在且非终态，再持久化信号并唤醒，
@@ -619,7 +620,7 @@ type Cloner interface {
 │   ├── scheduler.go         # Worker Pool 与 TaskQueue 实现 (对应第 8 节)
 │   ├── waiters.go           # WaitDone 等待者注册表（进程内，纯观测旁路）
 │   ├── errors.go            # 定义哨兵错误 (ErrSleeping, ErrAwaiting, ErrReturn)
-│   ├── metrics.go           # observ.Meter 指标句柄与埋点（观测纯旁路）
+│   ├── metrics.go           # OTel metric.Meter 指标句柄与埋点（观测纯旁路）
 │   ├── options.go           # ExecutionConfig 与 Option 模式 (对应第 3.4 节)
 │   ├── testing.go           # TestOptions / SetTestOptions / RunOnce 测试钩子
 │   └── workflow.go          # WorkflowFunc 类型定义，注册表逻辑

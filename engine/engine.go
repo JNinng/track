@@ -13,11 +13,24 @@ import (
 	"sync"
 	"time"
 
-	"github.com/jninng/observ"
 	"github.com/jninng/track/clock"
 	"github.com/jninng/track/model"
 	"github.com/jninng/track/store"
 )
+
+// 结构化日志与指标的属性键（对齐 OTel 语义约定子集，snake_case）：跨库聚合
+// 口径稳定，改名会破坏既有仪表盘与日志检索。值只允许标识符与枚举，禁止业务
+// payload 进基数。
+const (
+	// AttrRunID 一次执行/运行的标识符。
+	AttrRunID = "run_id"
+	// AttrWorkflow 工作流/任务名。
+	AttrWorkflow = "workflow"
+)
+
+// defaultLogger 是未注入 WithLogger 时的缺省日志出口：DiscardHandler 全量
+// 静默——库不产生意外的 stderr 噪声（不默认使用 slog.Default()）。
+var defaultLogger = slog.New(slog.DiscardHandler)
 
 // Engine 是工作流引擎的顶层句柄。
 type Engine struct {
@@ -30,14 +43,15 @@ type Engine struct {
 	// recoverInterval 是周期性后台 Recover 扫描的间隔；<=0 表示禁用。
 	recoverInterval time.Duration
 
-	// logger 是观测日志出口（observ.Logger），仅用于低频生命周期事件
-	// （observ 接入规范第 5 条）。NewEngine 构造期读取 observ.DefaultLogger()
-	// 并固定（快照语义），可用 WithLogger 注入其它实现。
-	logger observ.Logger
+	// logger 是观测日志出口（*slog.Logger），仅用于低频生命周期事件。
+	// NewEngine 构造期固定为 defaultLogger（静默），可用 WithLogger 注入
+	// 其它实现；构造期快照语义——引擎之间互不影响。
+	logger *slog.Logger
 
-	// metrics 是引擎全部指标句柄（observ.Meter，见 metrics.go）：
-	// NewEngine 构造期经 newMetrics 一次构建，默认 NoopMeter（零输出零开销），
-	// 可用 WithMeter 注入。热路径只做 Inc/Observe，不改变执行语义。
+	// metrics 是引擎全部指标句柄（OTel metric.Meter 仪表，见 metrics.go）：
+	// NewEngine 构造期经 newMetrics 一次构建，默认不埋点（全 nil 句柄，
+	// 零输出零开销），可用 WithMeter 注入。热路径只做 Add/Record，
+	// 不改变执行语义。
 	metrics *metrics
 
 	mu     sync.RWMutex
@@ -63,8 +77,8 @@ func NewEngine(s store.Interface, opts ...EngineOption) *Engine {
 		clock:           clock.RealClock{},
 		workers:         defaultWorkers,
 		recoverInterval: 30 * time.Second,
-		logger:          observ.DefaultLogger(),
-		metrics:         newMetrics(observ.NoopMeter),
+		logger:          defaultLogger,
+		metrics:         newMetrics(nil),
 		waiters:         newWaiterRegistry(),
 		ctx:             ctx,
 		cancel:          cancel,
@@ -76,7 +90,7 @@ func NewEngine(s store.Interface, opts ...EngineOption) *Engine {
 	e.sched.start()
 	// 构造期配置快照（低频生命周期事件，进程一次）：workers/queue_size 取
 	// 调度器生效值（newScheduler 已按默认逻辑补全）。
-	logWith(e.logger, slog.LevelInfo, "engine: started",
+	logWith(context.Background(), e.logger, slog.LevelInfo, "engine: started",
 		slog.Int("workers", e.sched.workers),
 		slog.Int("queue_size", cap(e.sched.queue)),
 		slog.Int64("recover_interval_seconds", int64(e.recoverInterval/time.Second)))
@@ -86,12 +100,13 @@ func NewEngine(s store.Interface, opts ...EngineOption) *Engine {
 	return e
 }
 
-// logWith 是引擎内部统一的日志出口：经由 observ.Logger 输出结构化日志，
-// 并 recover 用户 Logger 回调的 panic（observ 接入规范第 3、6 条：回调 panic
-// 必须被业务库兜住，观测为纯旁路，不得改变业务执行语义）。
-func logWith(l observ.Logger, level slog.Level, msg string, attrs ...slog.Attr) {
+// logWith 是引擎内部统一的日志出口：经由 *slog.Logger 输出结构化日志，
+// 并 recover 用户 Handler 的 panic（观测为纯旁路：任何日志实现异常都不得
+// 改变业务执行语义）。ctx 透传给 Handler，链路上下文（如 trace 关联）由此生效；
+// 级别门控交给 Logger 内部，禁用级别下属性构造随调用短路。
+func logWith(ctx context.Context, l *slog.Logger, level slog.Level, msg string, attrs ...slog.Attr) {
 	defer func() { _ = recover() }()
-	l.Log(level, msg, attrs...)
+	l.LogAttrs(ctx, level, msg, attrs...)
 }
 
 // Register 注册一个工作流。同名注册会覆盖。
@@ -131,22 +146,22 @@ func (e *Engine) Start(ctx context.Context, name string, input any) (model.RunID
 	}
 
 	// 实例已持久化：记录生命周期事件（run 时间线锚点，低频）。
-	logWith(e.logger, slog.LevelInfo, "engine: run started",
-		slog.String(observ.AttrRunID, string(runID)),
-		slog.String(observ.AttrWorkflow, name))
+	logWith(ctx, e.logger, slog.LevelInfo, "engine: run started",
+		slog.String(AttrRunID, string(runID)),
+		slog.String(AttrWorkflow, name))
 
 	// 首次 Start 自动触发 Recover 扫描（恢复因崩溃遗留的任务）。
 	// 排除本次刚创建的实例：它随后的 dispatch 会投递，避免同实例双投递。
 	e.recoverOnce.Do(func() {
 		if !e.testOpts.noAutoRecover {
 			if rerr := e.recoverExcept(ctx, runID); rerr != nil {
-				logWith(e.logger, slog.LevelWarn, "engine: auto recover failed",
-					slog.String(observ.AttrRunID, string(runID)), slog.Any("error", rerr))
+				logWith(ctx, e.logger, slog.LevelWarn, "engine: auto recover failed",
+					slog.String(AttrRunID, string(runID)), slog.Any("error", rerr))
 			}
 		}
 	})
 
-	e.dispatch(runID, srcStart)
+	e.dispatch(ctx, runID, srcStart)
 	return runID, nil
 }
 
@@ -163,12 +178,10 @@ func (e *Engine) Signal(ctx context.Context, runID model.RunID, signal model.Sig
 	if m.Status.IsTerminal() {
 		// 已终态：信号无意义，no-op。Debug 级记录——外部发送方拿到 nil 但信号
 		// 未生效时，这是唯一的排查线索（如工作流已超时完成、信号晚到）。
-		e.metrics.signalsIgnored.Inc()
-		if e.logger.Enabled(slog.LevelDebug) {
-			logWith(e.logger, slog.LevelDebug, "engine: signal ignored, run already terminal",
-				slog.String(observ.AttrRunID, string(runID)),
-				slog.String("signal", string(signal)))
-		}
+		e.metrics.add(ctx, e.metrics.signalsIgnored)
+		logWith(ctx, e.logger, slog.LevelDebug, "engine: signal ignored, run already terminal",
+			slog.String(AttrRunID, string(runID)),
+			slog.String("signal", string(signal)))
 		return nil // 已终态：信号无意义，no-op。
 	}
 
@@ -183,13 +196,13 @@ func (e *Engine) Signal(ctx context.Context, runID model.RunID, signal model.Sig
 	if err := e.store.Push(ctx, runID, signal, pb); err != nil {
 		return err
 	}
-	e.metrics.signalsReceived.Inc()
+	e.metrics.add(ctx, e.metrics.signalsReceived)
 	// API 事件：信号已持久化并唤醒实例（低频）。消费侧见 Await 的
 	// signal consumed——received 后无 consumed 即信号滞留/丢失。
-	logWith(e.logger, slog.LevelInfo, "engine: signal received",
-		slog.String(observ.AttrRunID, string(runID)),
+	logWith(ctx, e.logger, slog.LevelInfo, "engine: signal received",
+		slog.String(AttrRunID, string(runID)),
 		slog.String("signal", string(signal)))
-	e.dispatch(runID, srcSignal)
+	e.dispatch(ctx, runID, srcSignal)
 	return nil
 }
 
@@ -245,15 +258,15 @@ func (e *Engine) Retry(ctx context.Context, runID model.RunID) error {
 	e.releaseRunLock(ctx, runID, "retry")
 
 	// API 事件：终态重置完成、任务重新进入调度（低频）。
-	logWith(e.logger, slog.LevelInfo, "engine: run retried",
-		slog.String(observ.AttrRunID, string(runID)),
-		slog.String(observ.AttrWorkflow, m.Name))
+	logWith(ctx, e.logger, slog.LevelInfo, "engine: run retried",
+		slog.String(AttrRunID, string(runID)),
+		slog.String(AttrWorkflow, m.Name))
 
 	// 4. 释放锁后再投递：RunSync 模式下 dispatch 同步进入 run()，若仍持锁会
 	// 因 Acquire 失败（内存锁不可重入）丢失本次重投——与 scheduleWakeup 的
 	// 立即重投走异步 goroutine 同理。异步模式下释放与投递之间的窗口由 Recover
 	// 兜底（实例保持 Running，与崩溃语义一致）。
-	e.dispatch(runID, srcRetry)
+	e.dispatch(ctx, runID, srcRetry)
 	return nil
 }
 
@@ -261,8 +274,8 @@ func (e *Engine) Retry(ctx context.Context, runID model.RunID) error {
 // （与 run 循环的 defer Release 同构）。phase 仅用于日志归属（cancel/retry）。
 func (e *Engine) releaseRunLock(ctx context.Context, runID model.RunID, phase string) {
 	if rerr := e.store.Release(ctx, runID); rerr != nil {
-		logWith(e.logger, slog.LevelWarn, "engine: release lock failed ("+phase+")",
-			slog.String(observ.AttrRunID, string(runID)), slog.Any("error", rerr))
+		logWith(ctx, e.logger, slog.LevelWarn, "engine: release lock failed ("+phase+")",
+			slog.String(AttrRunID, string(runID)), slog.Any("error", rerr))
 	}
 }
 
@@ -305,11 +318,9 @@ func (e *Engine) Cancel(ctx context.Context, runID model.RunID, opts ...CancelOp
 		return err
 	}
 	if m.Status.IsTerminal() {
-		if e.logger.Enabled(slog.LevelDebug) {
-			logWith(e.logger, slog.LevelDebug, "engine: cancel ignored, run already terminal",
-				slog.String(observ.AttrRunID, string(runID)),
-				slog.String("status", m.Status.String()))
-		}
+		logWith(ctx, e.logger, slog.LevelDebug, "engine: cancel ignored, run already terminal",
+			slog.String(AttrRunID, string(runID)),
+			slog.String("status", m.Status.String()))
 		return nil
 	}
 
@@ -332,8 +343,8 @@ func (e *Engine) Cancel(ctx context.Context, runID model.RunID, opts ...CancelOp
 		}
 	}
 	if aerr := e.store.Append(ctx, runID, model.LogEntry{Kind: model.KindCancel, Payload: payload}); aerr != nil {
-		logWith(e.logger, slog.LevelWarn, "engine: append cancel journal failed (status already cancelled)",
-			slog.String(observ.AttrRunID, string(runID)), slog.Any("error", aerr))
+		logWith(ctx, e.logger, slog.LevelWarn, "engine: append cancel journal failed (status already cancelled)",
+			slog.String(AttrRunID, string(runID)), slog.Any("error", aerr))
 	}
 
 	// 4. 清除挂起期间注册的唤醒定时器，避免到期后一次无谓的终态跳过分发；
@@ -344,11 +355,11 @@ func (e *Engine) Cancel(ctx context.Context, runID model.RunID, opts ...CancelOp
 	// （元数据 + KindCancel 审计 + 无残留定时器），仍满足「终态落盘后才唤醒」。
 	e.waiters.notify(runID)
 
-	e.metrics.runsCancelled.Inc()
+	e.metrics.add(ctx, e.metrics.runsCancelled)
 	// API 事件：取消生效（低频），与 run started/completed/failed 构成完整时间线。
-	logWith(e.logger, slog.LevelInfo, "engine: run cancelled",
-		slog.String(observ.AttrRunID, string(runID)),
-		slog.String(observ.AttrWorkflow, m.Name),
+	logWith(ctx, e.logger, slog.LevelInfo, "engine: run cancelled",
+		slog.String(AttrRunID, string(runID)),
+		slog.String(AttrWorkflow, m.Name),
 		slog.String("reason", reason))
 	return nil
 }
@@ -405,10 +416,10 @@ func (e *Engine) Stop(ctx context.Context) error {
 	e.cancel()
 	err := e.sched.stop(ctx)
 	if err != nil {
-		logWith(e.logger, slog.LevelWarn, "engine: stop incomplete, workers still running",
+		logWith(ctx, e.logger, slog.LevelWarn, "engine: stop incomplete, workers still running",
 			slog.Any("error", err))
 	} else {
-		logWith(e.logger, slog.LevelInfo, "engine: stopped")
+		logWith(ctx, e.logger, slog.LevelInfo, "engine: stopped")
 	}
 	return err
 }
@@ -425,24 +436,23 @@ func (e *Engine) recoverExcept(ctx context.Context, exclude model.RunID) error {
 	if err != nil {
 		return err
 	}
-	e.metrics.recoverScans.Inc()
+	e.metrics.add(ctx, e.metrics.recoverScans)
 	dispatched := 0
 	for _, m := range metas {
 		if m.RunID == exclude {
 			continue
 		}
-		e.dispatch(m.RunID, srcRecover)
+		e.dispatch(ctx, m.RunID, srcRecover)
 		dispatched++
 	}
 	// 兜底扫描活动（30s 一次）：有实例被重新投递时 Info（运维可见）；
-	// 例行空扫仅 Debug（Enabled 门控，零构造成本）。
-	if dispatched > 0 {
-		logWith(e.logger, slog.LevelInfo, "engine: recover scan dispatched runs",
-			slog.Int("dispatched", dispatched))
-	} else if e.logger.Enabled(slog.LevelDebug) {
-		logWith(e.logger, slog.LevelDebug, "engine: recover scan dispatched runs",
-			slog.Int("dispatched", dispatched))
+	// 例行空扫仅 Debug（级别门控交给 Logger，零构造成本）。
+	level := slog.LevelInfo
+	if dispatched == 0 {
+		level = slog.LevelDebug
 	}
+	logWith(ctx, e.logger, level, "engine: recover scan dispatched runs",
+		slog.Int("dispatched", dispatched))
 	return nil
 }
 
@@ -462,7 +472,7 @@ func (e *Engine) recoverLoop() {
 				if e.ctx.Err() != nil {
 					return // 关闭中：静默退出。
 				}
-				logWith(e.logger, slog.LevelWarn, "engine: periodic recover failed", slog.Any("error", err))
+				logWith(e.ctx, e.logger, slog.LevelWarn, "engine: periodic recover failed", slog.Any("error", err))
 			}
 		}
 	}
@@ -470,15 +480,17 @@ func (e *Engine) recoverLoop() {
 
 // dispatch 将 RunID 投递给执行路径：同步模式下直接 run，否则进入调度器队列。
 //
-// source 标识本次投递的来源（见 dispatch source 常量），纯观测元数据：
-// 只进日志、不落盘、不参与重放匹配，对确定性零影响。
-func (e *Engine) dispatch(runID model.RunID, source string) {
-	e.metrics.incDispatch(source)
+// ctx 仅用于观测打点与日志（透传给 Handler 做链路关联），不传入 run——执行
+// 始终绑定引擎自身 ctx，避免调用方 ctx 取消误伤在途工作流。source 标识本次
+// 投递的来源（见 dispatch source 常量），纯观测元数据：只进日志、不落盘、
+// 不参与重放匹配，对确定性零影响。
+func (e *Engine) dispatch(ctx context.Context, runID model.RunID, source string) {
+	e.metrics.incDispatch(ctx, source)
 	if e.testOpts.runSync {
 		e.run(e.ctx, runID, source)
 		return
 	}
-	e.sched.enqueue(runID, source)
+	e.sched.enqueue(ctx, runID, source)
 }
 
 // dispatch source 常量（闭合枚举，纯日志元数据）。

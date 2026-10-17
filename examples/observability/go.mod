@@ -1,6 +1,6 @@
-// 独立模块：把 prometheus 依赖树隔离在示例内，
-// 引擎根模块仅依赖 observ 契约模块、不引入 prometheus（与 observ 自身
-// adapters 独立成模块同理）。
+// 独立模块：把 prometheus 与 OTel exporter 依赖树隔离在示例内，
+// 引擎根模块仅依赖 otel/metric、不引入 prometheus（otel 各包独立成嵌套
+// module，同理）。
 //
 // 运行：cd examples/observability && go run .
 module github.com/jninng/track/examples/observability
@@ -8,20 +8,33 @@ module github.com/jninng/track/examples/observability
 go 1.26.2
 
 require (
-	github.com/jninng/observ v0.1.0
-	github.com/jninng/observ/adapters/prom v0.1.0
 	github.com/jninng/track v0.0.0
-	github.com/prometheus/client_golang v1.19.1
-	github.com/prometheus/common v0.48.0
+	github.com/prometheus/client_golang v1.23.2
+	github.com/prometheus/common v0.67.4
+	go.opentelemetry.io/otel/exporters/prometheus v0.61.0
+	go.opentelemetry.io/otel/sdk/metric v1.47.0
 )
 
 require (
 	github.com/beorn7/perks v1.0.1 // indirect
-	github.com/cespare/xxhash/v2 v2.2.0 // indirect
-	github.com/prometheus/client_model v0.5.0 // indirect
-	github.com/prometheus/procfs v0.12.0 // indirect
-	golang.org/x/sys v0.17.0 // indirect
-	google.golang.org/protobuf v1.33.0 // indirect
+	github.com/cespare/xxhash/v2 v2.3.0 // indirect
+	github.com/go-logr/logr v1.4.4 // indirect
+	github.com/go-logr/stdr v1.2.2 // indirect
+	github.com/google/uuid v1.6.0 // indirect
+	github.com/kr/text v0.2.0 // indirect
+	github.com/munnerz/goautoneg v0.0.0-20191010083416-a7dc8b61c822 // indirect
+	github.com/prometheus/client_model v0.6.2 // indirect
+	github.com/prometheus/otlptranslator v1.0.0 // indirect
+	github.com/prometheus/procfs v0.19.2 // indirect
+	go.opentelemetry.io/auto/sdk v1.2.1 // indirect
+	go.opentelemetry.io/otel v1.47.0 // indirect
+	go.opentelemetry.io/otel/log v1.47.0 // indirect
+	go.opentelemetry.io/otel/metric v1.47.0 // indirect
+	go.opentelemetry.io/otel/sdk v1.47.0 // indirect
+	go.opentelemetry.io/otel/trace v1.47.0 // indirect
+	go.yaml.in/yaml/v2 v2.4.3 // indirect
+	golang.org/x/sys v0.48.0 // indirect
+	google.golang.org/protobuf v1.36.10 // indirect
 )
 
 replace github.com/jninng/track => ../..

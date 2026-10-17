@@ -20,10 +20,13 @@ go vet ./...            # static checks
 go run ./examples       # run the hello workflow end-to-end
 ```
 
-One dependency: `github.com/jninng/observ` (zero-dep Logger/Meter contract module,
-used by `engine` for logs & metrics). No other external deps / no Makefile / no
-codegen. Single import root — the prometheus dep tree stays isolated in the
-separate `examples/observability` module.
+Metrics seam: `go.opentelemetry.io/otel/metric` (the only runtime dep; logging
+is stdlib `log/slog`, silent by default via `slog.DiscardHandler`). Tests may
+additionally use `go.opentelemetry.io/otel/sdk/metric` (ManualReader) for
+metric-value assertions — the sdk must never appear in library (non-test)
+imports. No Makefile / no codegen. Single import root — the prometheus +
+OTel exporter dep tree stays isolated in the separate `examples/observability`
+module.
 
 ## Directory map
 
@@ -40,8 +43,8 @@ policy/    RetryPolicy interface + NoRetry/FixedDelay/ExponentialBackoff
 examples/  hello_workflow.go end-to-end demo;
            examples/replay determinism replay demo;
            examples/observability SEPARATE module (own go.mod, replace to root)
-           wiring observ.Logger(slog) + observ.Meter(prom adapter) — keeps the
-           prometheus dep tree out of the root module
+           wiring *slog.Logger + otel metric.Meter (OTel Prometheus exporter) —
+           keeps the prometheus/otel-exporter dep tree out of the root module
 docs/track.md   the contract
 docs/engine.md  descriptive runtime view (how the engine actually runs);
                 complements the contract, references code by symbol not line

@@ -3,118 +3,97 @@ package engine
 import (
 	"context"
 	"errors"
-	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
-	"github.com/jninng/observ"
 	"github.com/jninng/track/clock"
 	"github.com/jninng/track/infra/memory"
 	"github.com/jninng/track/model"
+	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
+	"go.opentelemetry.io/otel/sdk/metric/metricdata"
 )
 
-// memMeter 是内存版 observ.Meter，供测试断言指标计数。
-type memMeter struct {
-	mu         sync.Mutex
-	counters   map[string]*memCounter
-	gauges     map[string]*memGauge
-	histograms map[string]*memHistogram
+// meterScope 是引擎指标在 OTel 中的 Meter 名（惯例取包导入路径）。
+const meterScope = "github.com/jninng/track/engine"
+
+// meterProbe 经 OTel sdk/metric 的 ManualReader 收集引擎指标供测试断言。
+// OTel 同步仪表接口是密封的（内嵌未导出标记方法），外部包无法实现——
+// 可 fake 的只有 Meter，仪表值断言必须走 sdk 收集：
+// Sum 取累计和、Gauge 取最新值、Histogram 取观测次数。
+type meterProbe struct {
+	reader *sdkmetric.ManualReader
 }
 
-type memCounter struct {
-	mu sync.Mutex
-	v  float64
-}
-
-func (c *memCounter) Inc()          { c.mu.Lock(); c.v++; c.mu.Unlock() }
-func (c *memCounter) Add(v float64) { c.mu.Lock(); c.v += v; c.mu.Unlock() }
-
-type memGauge struct {
-	mu sync.Mutex
-	v  float64
-}
-
-func (g *memGauge) Set(v float64) { g.mu.Lock(); g.v = v; g.mu.Unlock() }
-func (g *memGauge) Add(v float64) { g.mu.Lock(); g.v += v; g.mu.Unlock() }
-
-type memHistogram struct {
-	mu     sync.Mutex
-	values []float64
-}
-
-func (h *memHistogram) Observe(v float64) {
-	h.mu.Lock()
-	h.values = append(h.values, v)
-	h.mu.Unlock()
-}
-
-func newMemMeter() *memMeter {
-	return &memMeter{
-		counters:   make(map[string]*memCounter),
-		gauges:     make(map[string]*memGauge),
-		histograms: make(map[string]*memHistogram),
-	}
-}
-
-func (m *memMeter) NewCounter(name, help string) observ.Counter {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	c := &memCounter{}
-	m.counters[name] = c
-	return c
-}
-
-func (m *memMeter) NewGauge(name, help string) observ.Gauge {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	g := &memGauge{}
-	m.gauges[name] = g
-	return g
-}
-
-func (m *memMeter) NewHistogram(name, help string, buckets []float64) observ.Histogram {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	h := &memHistogram{}
-	m.histograms[name] = h
-	return h
-}
-
-// counter 返回指标当前值；不存在（未注册该名）返回 -1 以区分 0。
-func (m *memMeter) counter(name string) float64 {
-	m.mu.Lock()
-	c, ok := m.counters[name]
-	m.mu.Unlock()
-	if !ok {
-		return -1
-	}
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return c.v
-}
-
-// observed 返回直方图观测次数。
-func (m *memMeter) observed(name string) int {
-	m.mu.Lock()
-	h, ok := m.histograms[name]
-	m.mu.Unlock()
-	if !ok {
-		return -1
-	}
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	return len(h.values)
-}
-
-// newMeterEngine 构造注入内存 meter 的同步引擎。
-func newMeterEngine(t *testing.T, clk clock.Clock, m observ.Meter) (*Engine, *memory.Store, *memMeter) {
+// newMeterProbe 构造 ManualReader 支撑的探针，provider 随测试结束关闭。
+func newMeterProbe(t *testing.T) (*meterProbe, *sdkmetric.MeterProvider) {
 	t.Helper()
+	reader := sdkmetric.NewManualReader()
+	provider := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
+	t.Cleanup(func() { _ = provider.Shutdown(context.Background()) })
+	return &meterProbe{reader: reader}, provider
+}
+
+// collect 返回名为 name 的指标的聚合数据；不存在返回 nil。
+func (p *meterProbe) collect(t *testing.T, name string) metricdata.Aggregation {
+	t.Helper()
+	var rm metricdata.ResourceMetrics
+	if err := p.reader.Collect(context.Background(), &rm); err != nil {
+		t.Fatalf("collect metrics: %v", err)
+	}
+	for _, sm := range rm.ScopeMetrics {
+		for _, m := range sm.Metrics {
+			if m.Name == name {
+				return m.Data
+			}
+		}
+	}
+	return nil
+}
+
+// counter 返回计数器当前累计值。otel sdk 的计数器流在首次记录时才物化：
+// 指标缺席即「从未记录」，与值 0 同义，计为 0（这些断言的意图是「该路径
+// 未触发」，缺席正是其证据；仪表创建集中在 newMetrics，名字漂移由非零
+// 断言与示例的对照输出兜底）。
+func (p *meterProbe) counter(t *testing.T, name string) float64 {
+	t.Helper()
+	sum, ok := p.collect(t, name).(metricdata.Sum[int64])
+	if !ok || len(sum.DataPoints) == 0 {
+		return 0
+	}
+	return float64(sum.DataPoints[0].Value)
+}
+
+// gauge 返回最新水位；尚无数据点返回 -1 以区分 0。
+func (p *meterProbe) gauge(t *testing.T, name string) float64 {
+	t.Helper()
+	g, ok := p.collect(t, name).(metricdata.Gauge[int64])
+	if !ok || len(g.DataPoints) == 0 {
+		return -1
+	}
+	return float64(g.DataPoints[0].Value)
+}
+
+// observed 返回直方图观测次数；尚无数据返回 0。
+func (p *meterProbe) observed(t *testing.T, name string) int {
+	t.Helper()
+	h, ok := p.collect(t, name).(metricdata.Histogram[float64])
+	if !ok || len(h.DataPoints) == 0 {
+		return 0
+	}
+	return int(h.DataPoints[0].Count)
+}
+
+// newMeterEngine 构造注入 ManualReader 支撑 otel Meter 的同步引擎，
+// 返回探针供指标断言。
+func newMeterEngine(t *testing.T, clk clock.Clock) (*Engine, *memory.Store, *meterProbe) {
+	t.Helper()
+	p, provider := newMeterProbe(t)
 	s := memory.New()
-	e := NewEngine(s, WithClock(clk), WithMeter(m))
+	e := NewEngine(s, WithClock(clk), WithMeter(provider.Meter(meterScope)))
 	e.testOpts.runSync = true
 	e.testOpts.noAutoRecover = true
-	return e, s, m.(*memMeter)
+	return e, s, p
 }
 
 // waitStatus 轮询直到实例进入指定状态或超时（用于消除异步唤醒的时序竞争）。
@@ -157,8 +136,7 @@ func waitJournalKind(t *testing.T, s *memory.Store, runID model.RunID, kind mode
 // 分发来源枚举拆名、run 终局、信号闭环、journal 追加、run 耗时观测。
 func TestMetricsLifecycle(t *testing.T) {
 	clk := clock.NewFakeClock()
-	m := newMemMeter()
-	e, st, mm := newMeterEngine(t, clk, m)
+	e, st, p := newMeterEngine(t, clk)
 
 	e.Register("w", func(wf *WorkflowContext) error {
 		if _, err := Execute(wf, func(ctx context.Context) (int, error) {
@@ -211,12 +189,12 @@ func TestMetricsLifecycle(t *testing.T) {
 		"track_lock_contended_total": 0,
 		"track_queue_dropped_total":  0,
 	} {
-		if got := mm.counter(name); got != want {
+		if got := p.counter(t, name); got != want {
 			t.Errorf("%s = %v, want %v", name, got, want)
 		}
 	}
 	// run 尝试次数：start + timer + signal 共 3 次，各观测一次耗时。
-	if got := mm.observed("track_run_duration_seconds"); got != 3 {
+	if got := p.observed(t, "track_run_duration_seconds"); got != 3 {
 		t.Errorf("run duration observations = %d, want 3", got)
 	}
 	if err := e.Stop(context.Background()); err != nil {
@@ -227,8 +205,7 @@ func TestMetricsLifecycle(t *testing.T) {
 // 失败终局与信号忽略的计数断言。
 func TestMetricsFailureAndIgnoredSignal(t *testing.T) {
 	clk := clock.NewFakeClock()
-	m := newMemMeter()
-	e, _, mm := newMeterEngine(t, clk, m)
+	e, _, p := newMeterEngine(t, clk)
 
 	e.Register("w", func(wf *WorkflowContext) error {
 		return errors.New("boom")
@@ -253,7 +230,7 @@ func TestMetricsFailureAndIgnoredSignal(t *testing.T) {
 		"track_signals_ignored_total":  1,
 		"track_signals_received_total": 0,
 	} {
-		if got := mm.counter(name); got != want {
+		if got := p.counter(t, name); got != want {
 			t.Errorf("%s = %v, want %v", name, got, want)
 		}
 	}
@@ -262,36 +239,23 @@ func TestMetricsFailureAndIgnoredSignal(t *testing.T) {
 	}
 }
 
-// gauge 返回当前值；不存在返回 -1。
-func (m *memMeter) gauge(name string) float64 {
-	m.mu.Lock()
-	g, ok := m.gauges[name]
-	m.mu.Unlock()
-	if !ok {
-		return -1
-	}
-	g.mu.Lock()
-	defer g.mu.Unlock()
-	return g.v
-}
-
 // 队列满丢弃与深度水位：使用未启动 Worker 的独立调度器（无消费者），
 // 容量 1 的队列第二次 enqueue 必然丢弃，水位保持 1。
 func TestMetricsQueueDropAndDepth(t *testing.T) {
 	clk := clock.NewFakeClock()
-	m := newMemMeter()
+	p, provider := newMeterProbe(t)
 	s := memory.New()
-	e := NewEngine(s, WithClock(clk), WithMeter(m), WithWorkers(1), WithQueueSize(1))
+	e := NewEngine(s, WithClock(clk), WithMeter(provider.Meter(meterScope)), WithWorkers(1), WithQueueSize(1))
 	// 独立调度器（不 start）：队列无消费者，计数确定。
 	sch := newScheduler(e, 1, 1)
 
-	sch.enqueue("run_a", srcManual)
-	sch.enqueue("run_b", srcManual) // 队列已满：丢弃。
+	sch.enqueue(context.Background(), "run_a", srcManual)
+	sch.enqueue(context.Background(), "run_b", srcManual) // 队列已满：丢弃。
 
-	if got := m.counter("track_queue_dropped_total"); got != 1 {
+	if got := p.counter(t, "track_queue_dropped_total"); got != 1 {
 		t.Errorf("queue dropped = %v, want 1", got)
 	}
-	if got := m.gauge("track_queue_depth"); got != 1 {
+	if got := p.gauge(t, "track_queue_depth"); got != 1 {
 		t.Errorf("queue depth = %v, want 1", got)
 	}
 	if err := e.Stop(context.Background()); err != nil {
@@ -303,11 +267,11 @@ func TestMetricsQueueDropAndDepth(t *testing.T) {
 // 若只在 enqueue 时更新，队列排空后指标停留在旧水位，系统性高估、误导告警。
 //
 // 用首个任务占住唯一 Worker，保证第二个任务入队后深度确定为 1（排除
-// enqueue 的 Set(len) 与 Worker 抢消费的竞态），再放行验证消费后归零。
+// enqueue 的记录与 Worker 抢消费的竞态），再放行验证消费后归零。
 func TestMetricsQueueDepthDrainsAfterConsume(t *testing.T) {
-	m := newMemMeter()
+	p, provider := newMeterProbe(t)
 	s := memory.New()
-	e := NewEngine(s, WithClock(clock.NewFakeClock()), WithMeter(m), WithWorkers(1))
+	e := NewEngine(s, WithClock(clock.NewFakeClock()), WithMeter(provider.Meter(meterScope)), WithWorkers(1))
 	e.SetTestOptions(TestOptions{NoAutoRecover: true})
 	defer e.Stop(context.Background())
 
@@ -332,14 +296,14 @@ func TestMetricsQueueDepthDrainsAfterConsume(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := m.gauge("track_queue_depth"); got != 1 {
+	if got := p.gauge(t, "track_queue_depth"); got != 1 {
 		t.Fatalf("precondition: queue depth = %v, want 1 (rid2 queued behind busy worker)", got)
 	}
 
 	close(release) // 放行：Worker 依次完成 rid1、消费 rid2。
 	waitStatus(t, e, rid2, model.StatusSucceeded, time.Second)
 	waitStatus(t, e, rid1, model.StatusSucceeded, time.Second)
-	if got := m.gauge("track_queue_depth"); got != 0 {
+	if got := p.gauge(t, "track_queue_depth"); got != 0 {
 		t.Fatalf("queue depth = %v after queue drained, want 0", got)
 	}
 }

@@ -109,7 +109,7 @@ e.Recover(ctx) error                   // 手动扫描存储，恢复崩溃遗�
 e.Stop(ctx) error                      // 优雅关闭（ctx 控制最长等待时间）
 ```
 
-引擎配置：`WithClock`（注入 `FakeClock` 用于测试）、`WithWorkers`（Worker 数，默认 8）、`WithQueueSize`（队列容量，默认 workers×4）、`WithRecoverInterval`（周期性后台兜底扫描间隔，默认 30s）。观测出口经 `WithLogger` / `WithMeter` 注入（缺省零输出零开销），见 [`examples/observability`](examples/observability)。
+引擎配置：`WithClock`（注入 `FakeClock` 用于测试）、`WithWorkers`（Worker 数，默认 8）、`WithQueueSize`（队列容量，默认 workers×4）、`WithRecoverInterval`（周期性后台兜底扫描间隔，默认 30s）。观测出口经 `WithLogger`（注入 `*slog.Logger`，缺省静默）与 `WithMeter`（注入 OTel `metric.Meter`，缺省不埋点）注入，见 [`examples/observability`](examples/observability)。
 
 ## 运行与测试
 

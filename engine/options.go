@@ -1,11 +1,12 @@
 package engine
 
 import (
+	"log/slog"
 	"time"
 
-	"github.com/jninng/observ"
 	"github.com/jninng/track/clock"
 	"github.com/jninng/track/policy"
+	"go.opentelemetry.io/otel/metric"
 )
 
 // 默认 Worker 数量。
@@ -59,11 +60,11 @@ func WithClock(c clock.Clock) EngineOption {
 	}
 }
 
-// WithLogger 注入观测日志出口（observ.Logger）。
+// WithLogger 注入观测日志出口（*slog.Logger）。
 //
-// 未注入时，NewEngine 构造期读取 observ.DefaultLogger() 并固定（快照语义），
-// 之后对 observ.SetDefaultLogger 的调用不再影响本引擎。
-func WithLogger(l observ.Logger) EngineOption {
+// 未注入时引擎默认静默（slog.DiscardHandler，零输出），不默认使用
+// slog.Default()；注入 nil 与未注入等价。
+func WithLogger(l *slog.Logger) EngineOption {
 	return func(e *Engine) {
 		if l != nil {
 			e.logger = l
@@ -71,11 +72,12 @@ func WithLogger(l observ.Logger) EngineOption {
 	}
 }
 
-// WithMeter 注入指标出口（observ.Meter）。
+// WithMeter 注入指标出口（OTel metric.Meter）。
 //
-// 未注入时默认 NoopMeter（零输出、零开销）。注入会触发全部指标句柄的
-// 构造期创建（observ 规范：New* 仅允许在构造期调用）。
-func WithMeter(m observ.Meter) EngineOption {
+// 未注入时默认不埋点（meter 为 nil，零输出零开销），注入 nil 与未注入等价。
+// 全部指标句柄在构造期一次性创建，并绑定注入时刻的 Meter/Provider
+// （之后替换全局 Provider 不追溯已建仪表），热路径只做 Add/Record。
+func WithMeter(m metric.Meter) EngineOption {
 	return func(e *Engine) {
 		if m != nil {
 			e.metrics = newMetrics(m)

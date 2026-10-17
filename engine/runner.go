@@ -7,7 +7,6 @@ import (
 	"log/slog"
 	"time"
 
-	"github.com/jninng/observ"
 	"github.com/jninng/track/model"
 	"github.com/jninng/track/store"
 )
@@ -28,45 +27,41 @@ import (
 func (e *Engine) run(ctx context.Context, runID model.RunID, source string) {
 	// 单次 run 尝试耗时（含重放）：无论终局如何都观测（纯旁路）。
 	started := time.Now()
-	defer e.metrics.observeRunDuration(started)
+	defer e.metrics.observeRunDuration(ctx, started)
 
-	// 投递来源归属（Debug，门控）：回答「这次执行由谁触发」。并发交织下
+	// 投递来源归属（Debug）：回答「这次执行由谁触发」。并发交织下
 	// 相邻日志（signal received / wakeup fired 等）不再可靠，per-run 的
 	// source 是确定性归属。queue 可能延迟，本行在出队后、执行前打印。
-	if e.logger.Enabled(slog.LevelDebug) {
-		logWith(e.logger, slog.LevelDebug, "engine: run dispatched",
-			slog.String(observ.AttrRunID, string(runID)),
-			slog.String("source", source))
-	}
+	logWith(ctx, e.logger, slog.LevelDebug, "engine: run dispatched",
+		slog.String(AttrRunID, string(runID)),
+		slog.String("source", source))
 
 	// 1. 并发控制。
 	ok, err := e.store.Acquire(ctx, runID)
 	if err != nil {
-		logWith(e.logger, slog.LevelWarn, "engine: acquire lock failed",
-			slog.String(observ.AttrRunID, string(runID)), slog.Any("error", err))
+		logWith(ctx, e.logger, slog.LevelWarn, "engine: acquire lock failed",
+			slog.String(AttrRunID, string(runID)), slog.Any("error", err))
 		return
 	}
 	if !ok {
 		// 已有其它 Worker 持有锁：多 Worker 下的正常竞争，仅 Debug 级记录。
-		e.metrics.lockContended.Inc()
-		if e.logger.Enabled(slog.LevelDebug) {
-			logWith(e.logger, slog.LevelDebug, "engine: lock contended, run skipped",
-				slog.String(observ.AttrRunID, string(runID)))
-		}
+		e.metrics.add(ctx, e.metrics.lockContended)
+		logWith(ctx, e.logger, slog.LevelDebug, "engine: lock contended, run skipped",
+			slog.String(AttrRunID, string(runID)))
 		return // 已有其它 Worker 在处理。
 	}
 	defer func() {
 		if rerr := e.store.Release(ctx, runID); rerr != nil {
-			logWith(e.logger, slog.LevelWarn, "engine: release lock failed",
-				slog.String(observ.AttrRunID, string(runID)), slog.Any("error", rerr))
+			logWith(ctx, e.logger, slog.LevelWarn, "engine: release lock failed",
+				slog.String(AttrRunID, string(runID)), slog.Any("error", rerr))
 		}
 	}()
 
 	// 2. 读取元数据，跳过终态实例。
 	meta, err := e.store.GetResult(ctx, runID)
 	if err != nil {
-		logWith(e.logger, slog.LevelWarn, "engine: get meta failed",
-			slog.String(observ.AttrRunID, string(runID)), slog.Any("error", err))
+		logWith(ctx, e.logger, slog.LevelWarn, "engine: get meta failed",
+			slog.String(AttrRunID, string(runID)), slog.Any("error", err))
 		return
 	}
 	if meta.Status.IsTerminal() {
@@ -90,8 +85,8 @@ func (e *Engine) run(ctx context.Context, runID model.RunID, source string) {
 	// 4. 加载历史日志（按追加顺序）。
 	logs, err := e.store.Read(ctx, runID)
 	if err != nil {
-		logWith(e.logger, slog.LevelWarn, "engine: read logs failed",
-			slog.String(observ.AttrRunID, string(runID)), slog.Any("error", err))
+		logWith(ctx, e.logger, slog.LevelWarn, "engine: read logs failed",
+			slog.String(AttrRunID, string(runID)), slog.Any("error", err))
 		return
 	}
 
@@ -111,18 +106,18 @@ func (e *Engine) run(ctx context.Context, runID model.RunID, source string) {
 		metrics:  e.metrics,
 	}
 
-	// 重放模式锚定（历史日志非空）：确定性调试的关键钩子，仅 Debug 级（门控）。
-	if len(logs) > 0 && e.logger.Enabled(slog.LevelDebug) {
-		logWith(e.logger, slog.LevelDebug, "engine: run replaying",
-			slog.String(observ.AttrRunID, string(runID)),
-			slog.String(observ.AttrWorkflow, meta.Name),
+	// 重放模式锚定（历史日志非空）：确定性调试的关键钩子，仅 Debug 级。
+	if len(logs) > 0 {
+		logWith(ctx, e.logger, slog.LevelDebug, "engine: run replaying",
+			slog.String(AttrRunID, string(runID)),
+			slog.String(AttrWorkflow, meta.Name),
 			slog.Int("journal_len", len(logs)))
 	}
 
 	// 标记为运行中。
 	if err := e.store.UpdateStatus(ctx, runID, model.StatusRunning); err != nil {
-		logWith(e.logger, slog.LevelWarn, "engine: mark running failed",
-			slog.String(observ.AttrRunID, string(runID)), slog.Any("error", err))
+		logWith(ctx, e.logger, slog.LevelWarn, "engine: mark running failed",
+			slog.String(AttrRunID, string(runID)), slog.Any("error", err))
 		return
 	}
 
@@ -146,32 +141,32 @@ func (e *Engine) run(ctx context.Context, runID model.RunID, source string) {
 	case errors.Is(runErr, ErrSleeping):
 		// 挂起：等待睡眠 deadline 到达后唤醒。
 		if err := e.store.UpdateStatus(ctx, runID, model.StatusAwaiting); err != nil {
-			logWith(e.logger, slog.LevelWarn, "engine: mark awaiting failed",
-				slog.String(observ.AttrRunID, string(runID)), slog.Any("error", err))
+			logWith(ctx, e.logger, slog.LevelWarn, "engine: mark awaiting failed",
+				slog.String(AttrRunID, string(runID)), slog.Any("error", err))
 			return
 		}
 		// 挂起时间线只有日志能留下（meta 只存当前状态 + 最后一次 UpdatedAt）。
 		// message 区分挂起原语（sleep/await）：同一实例可多次挂起，仅看 deadline 易误读；
 		// 措辞与哨兵错误（ErrSleeping/ErrAwaiting）及 journal Kind 同词汇。
-		e.metrics.runsSuspended.Inc()
-		logWith(e.logger, slog.LevelInfo, "engine: run sleeping",
-			slog.String(observ.AttrRunID, string(runID)),
-			slog.String(observ.AttrWorkflow, meta.Name),
+		e.metrics.add(ctx, e.metrics.runsSuspended)
+		logWith(ctx, e.logger, slog.LevelInfo, "engine: run sleeping",
+			slog.String(AttrRunID, string(runID)),
+			slog.String(AttrWorkflow, meta.Name),
 			slog.Time("deadline", wf.sleepDeadline))
-		e.scheduleWakeup(runID, wf.sleepDeadline)
+		e.scheduleWakeup(ctx, runID, wf.sleepDeadline)
 	case errors.Is(runErr, ErrAwaiting):
 		// 挂起：等待外部信号或 await 超时唤醒。
 		if err := e.store.UpdateStatus(ctx, runID, model.StatusAwaiting); err != nil {
-			logWith(e.logger, slog.LevelWarn, "engine: mark awaiting failed",
-				slog.String(observ.AttrRunID, string(runID)), slog.Any("error", err))
+			logWith(ctx, e.logger, slog.LevelWarn, "engine: mark awaiting failed",
+				slog.String(AttrRunID, string(runID)), slog.Any("error", err))
 			return
 		}
-		e.metrics.runsSuspended.Inc()
-		logWith(e.logger, slog.LevelInfo, "engine: run awaiting",
-			slog.String(observ.AttrRunID, string(runID)),
-			slog.String(observ.AttrWorkflow, meta.Name),
+		e.metrics.add(ctx, e.metrics.runsSuspended)
+		logWith(ctx, e.logger, slog.LevelInfo, "engine: run awaiting",
+			slog.String(AttrRunID, string(runID)),
+			slog.String(AttrWorkflow, meta.Name),
 			slog.Time("deadline", wf.awaitDeadline))
-		e.scheduleWakeup(runID, wf.awaitDeadline)
+		e.scheduleWakeup(ctx, runID, wf.awaitDeadline)
 	case ctx.Err() != nil:
 		// 引擎正在关闭（内部 ctx 已取消）导致业务函数被中断：不判定为业务失败。
 		// 保持 Running 状态，交由重启后 Recover 按 journal 幂等重放——与进程崩溃
@@ -179,16 +174,16 @@ func (e *Engine) run(ctx context.Context, runID model.RunID, source string) {
 		// （Failed 为终态，Recover 跳过，造成在途工作流永久丢失）。
 		// 已落盘的 journal 步骤在重放时命中跳过，未执行的那一步会被重新执行，
 		// 故真正的业务错误（若存在）会在重启后正常运行时再次暴露并判 Failed。
-		e.metrics.runsInterrupted.Inc()
-		logWith(e.logger, slog.LevelInfo, "engine: run interrupted by shutdown, left Running for recovery",
-			slog.String(observ.AttrRunID, string(runID)))
+		e.metrics.add(ctx, e.metrics.runsInterrupted)
+		logWith(ctx, e.logger, slog.LevelInfo, "engine: run interrupted by shutdown, left Running for recovery",
+			slog.String(AttrRunID, string(runID)))
 	case isStorageError(runErr):
 		// 存储瞬时故障（Append/Fetch 失败等）：非业务错误，不判终态失败。
 		// 条目未写入，重试幂等安全；保持 Running 交由 Recover 兜底重试，
 		// 避免一次网络抖动永久杀死长时工作流。
-		e.metrics.runsInterrupted.Inc()
-		logWith(e.logger, slog.LevelWarn, "engine: run hit transient storage failure, left Running for recovery",
-			slog.String(observ.AttrRunID, string(runID)), slog.Any("error", runErr))
+		e.metrics.add(ctx, e.metrics.runsInterrupted)
+		logWith(ctx, e.logger, slog.LevelWarn, "engine: run hit transient storage failure, left Running for recovery",
+			slog.String(AttrRunID, string(runID)), slog.Any("error", runErr))
 	default:
 		// 业务返回普通 error 或原语返回 ErrJournalMismatch 等：标记失败。
 		// 若是 divergence（如 ErrJournalMismatch），其本身即错误信息。
@@ -228,9 +223,9 @@ func (e *Engine) failOnJournalDrift(ctx context.Context, runID model.RunID, name
 	return true
 }
 
-// scheduleWakeup 注册（或立即触发）实例的唤醒。
-func (e *Engine) scheduleWakeup(runID model.RunID, deadline time.Time) {
-	e.sched.scheduleWakeup(runID, deadline)
+// scheduleWakeup 注册（或立即触发）实例的唤醒。ctx 仅用于注册时的观测日志。
+func (e *Engine) scheduleWakeup(ctx context.Context, runID model.RunID, deadline time.Time) {
+	e.sched.scheduleWakeup(ctx, runID, deadline)
 }
 
 // succeed 标记成功并写入输出；成功是正常终态，以 Info 级输出完成事件，
@@ -241,30 +236,30 @@ func (e *Engine) succeed(ctx context.Context, runID model.RunID, name string, ou
 		opts = append(opts, store.WithOutput(output))
 	}
 	if err := e.store.UpdateStatus(ctx, runID, model.StatusSucceeded, opts...); err != nil {
-		logWith(e.logger, slog.LevelWarn, "engine: mark succeeded failed",
-			slog.String(observ.AttrRunID, string(runID)), slog.Any("error", err))
+		logWith(ctx, e.logger, slog.LevelWarn, "engine: mark succeeded failed",
+			slog.String(AttrRunID, string(runID)), slog.Any("error", err))
 		return
 	}
 	e.waiters.notify(runID)
-	e.metrics.runsSucceeded.Inc()
-	logWith(e.logger, slog.LevelInfo, "engine: run completed",
-		slog.String(observ.AttrRunID, string(runID)),
-		slog.String(observ.AttrWorkflow, name))
+	e.metrics.add(ctx, e.metrics.runsSucceeded)
+	logWith(ctx, e.logger, slog.LevelInfo, "engine: run completed",
+		slog.String(AttrRunID, string(runID)),
+		slog.String(AttrWorkflow, name))
 }
 
 // fail 标记失败并写入错误信息，成功后以 Error 级输出失败事件
 // （失败是异常生命周期事件；标记失败本身失败时仅 Warn，不误报 run failed）。
 func (e *Engine) fail(ctx context.Context, runID model.RunID, name, msg string) {
 	if err := e.store.UpdateStatus(ctx, runID, model.StatusFailed, store.WithErr(msg)); err != nil {
-		logWith(e.logger, slog.LevelWarn, "engine: mark failed failed",
-			slog.String(observ.AttrRunID, string(runID)), slog.Any("error", err))
+		logWith(ctx, e.logger, slog.LevelWarn, "engine: mark failed failed",
+			slog.String(AttrRunID, string(runID)), slog.Any("error", err))
 		return
 	}
 	e.waiters.notify(runID)
-	e.metrics.runsFailed.Inc()
-	logWith(e.logger, slog.LevelError, "engine: run failed",
-		slog.String(observ.AttrRunID, string(runID)),
-		slog.String(observ.AttrWorkflow, name),
+	e.metrics.add(ctx, e.metrics.runsFailed)
+	logWith(ctx, e.logger, slog.LevelError, "engine: run failed",
+		slog.String(AttrRunID, string(runID)),
+		slog.String(AttrWorkflow, name),
 		slog.String("error", msg))
 }
 

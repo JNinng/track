@@ -464,9 +464,9 @@ func TestRetryBusyWhileExecuting(t *testing.T) {
 // TestCancelMetrics 取消成功递增 track_runs_cancelled_total；终态 no-op 不递增。
 func TestCancelMetrics(t *testing.T) {
 	clk := clock.NewFakeClock()
-	meter := newMemMeter()
+	meter, provider := newMeterProbe(t)
 	s := memory.New()
-	e := NewEngine(s, WithClock(clk), WithMeter(meter))
+	e := NewEngine(s, WithClock(clk), WithMeter(provider.Meter(meterScope)))
 	e.testOpts.runSync = true
 	e.testOpts.noAutoRecover = true
 
@@ -481,14 +481,14 @@ func TestCancelMetrics(t *testing.T) {
 	if err := e.Cancel(context.Background(), rid); err != nil {
 		t.Fatal(err)
 	}
-	if got := meter.counter("track_runs_cancelled_total"); got != 1 {
+	if got := meter.counter(t, "track_runs_cancelled_total"); got != 1 {
 		t.Fatalf("track_runs_cancelled_total=%v want 1", got)
 	}
 	// 终态 no-op：不递增。
 	if err := e.Cancel(context.Background(), rid); err != nil {
 		t.Fatal(err)
 	}
-	if got := meter.counter("track_runs_cancelled_total"); got != 1 {
+	if got := meter.counter(t, "track_runs_cancelled_total"); got != 1 {
 		t.Fatalf("track_runs_cancelled_total=%v want 1 after no-op", got)
 	}
 }

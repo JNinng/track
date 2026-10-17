@@ -15,7 +15,6 @@ import (
 	"os"
 	"time"
 
-	"github.com/jninng/observ"
 	"github.com/jninng/track/clock"
 	"github.com/jninng/track/engine"
 	"github.com/jninng/track/infra/memory"
@@ -30,11 +29,11 @@ type HelloInput struct {
 
 func main() {
 	// 1. 装配引擎：内存后端 + 默认 Worker Pool。
-	// 引擎内部日志经 observ.Logger 输出：此处桥接 slog 到 stderr，并开启
-	// Debug 级以展示完整时间线（唤醒调度/触发、重放等）；
-	// 不注入也不设置默认 Logger 时，引擎保持零输出。
-	logger := observ.NewSlogLogger(slog.New(slog.NewTextHandler(os.Stderr,
-		&slog.HandlerOptions{Level: slog.LevelDebug})))
+	// 引擎日志出口是 *slog.Logger（WithLogger 注入）：这里输出到 stderr 并
+	// 开启 Debug 级，展示完整时间线（唤醒调度/触发、重放等）；
+	// 不注入时引擎默认静默（DiscardHandler，零输出）。
+	logger := slog.New(slog.NewTextHandler(os.Stderr,
+		&slog.HandlerOptions{Level: slog.LevelDebug}))
 	store := memory.New()
 	e := engine.NewEngine(store, engine.WithWorkers(4), engine.WithClock(clock.RealClock{}),
 		engine.WithLogger(logger))
@@ -42,14 +41,14 @@ func main() {
 
 	// 2. 注册工作流。
 	if err := e.Register("HelloWorkflow", HelloWorkflow); err != nil {
-		logger.Log(slog.LevelError, "register workflow failed", slog.Any("error", err))
+		logger.Error("register workflow failed", "error", err)
 		os.Exit(1)
 	}
 
 	// 3. 启动一个新实例。
 	runID, err := e.Start(context.Background(), "HelloWorkflow", HelloInput{Name: "World"})
 	if err != nil {
-		logger.Log(slog.LevelError, "start workflow failed", slog.Any("error", err))
+		logger.Error("start workflow failed", "error", err)
 		os.Exit(1)
 	}
 	fmt.Println("started run:", runID)
@@ -64,7 +63,7 @@ func main() {
 	defer cancelWait()
 	result, err := e.WaitDone(waitCtx, runID)
 	if err != nil {
-		logger.Log(slog.LevelError, "wait result failed", slog.Any("error", err))
+		logger.Error("wait result failed", "error", err)
 		os.Exit(1)
 	}
 
@@ -77,7 +76,7 @@ func main() {
 	// 6. 读取该实例的全部日志（journal）并打印。
 	logs, err := readJournal(context.Background(), store, runID)
 	if err != nil {
-		logger.Log(slog.LevelError, "read journal failed", slog.Any("error", err))
+		logger.Error("read journal failed", "error", err)
 		os.Exit(1)
 	}
 	fmt.Println("journal:")
@@ -95,11 +94,11 @@ func main() {
 // 真实场景中信号来自外部系统（审批回调、Webhook、消息队列消费者）——
 // Signal 是引擎的入站 API。这里在短暂延迟后投递，模拟「工作流 Await 挂起
 // 期间，外部审批系统批准了该请求」。
-func sendApprovalSignal(e *engine.Engine, logger observ.Logger, runID model.RunID) {
+func sendApprovalSignal(e *engine.Engine, logger *slog.Logger, runID model.RunID) {
 	time.Sleep(100 * time.Millisecond)
 	fmt.Println("sending signal: approved")
 	if err := e.Signal(context.Background(), runID, "approved", map[string]string{"by": "ops"}); err != nil {
-		logger.Log(slog.LevelWarn, "signal error", slog.Any("error", err))
+		logger.Warn("signal error", "error", err)
 	}
 }
 

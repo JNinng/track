@@ -9,15 +9,14 @@ import (
 	"testing"
 	"time"
 
-	"github.com/jninng/observ"
 	"github.com/jninng/track/clock"
 	"github.com/jninng/track/infra/memory"
 	"github.com/jninng/track/model"
 )
 
-// recordingLogger 实现 observ.Logger，记录全部日志供测试断言。
-// Enabled 恒 true：测试要验证的是"日志真的发出去了"。
-type recordingLogger struct {
+// recordingHandler 是内存版 slog.Handler，记录全部日志供测试断言。
+// Enabled 恒 true：测试要验证的是“日志真的发出去了”。
+type recordingHandler struct {
 	mu   sync.Mutex
 	recs []logRecord
 }
@@ -28,47 +27,72 @@ type logRecord struct {
 	attrs []slog.Attr
 }
 
-func (r *recordingLogger) Enabled(level slog.Level) bool { return true }
+func (h *recordingHandler) Enabled(context.Context, slog.Level) bool { return true }
 
-func (r *recordingLogger) Log(level slog.Level, msg string, attrs ...slog.Attr) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	r.recs = append(r.recs, logRecord{level: level, msg: msg, attrs: append([]slog.Attr(nil), attrs...)})
+func (h *recordingHandler) Handle(_ context.Context, r slog.Record) error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	rec := logRecord{level: r.Level, msg: r.Message}
+	r.Attrs(func(a slog.Attr) bool {
+		rec.attrs = append(rec.attrs, a)
+		return true
+	})
+	h.recs = append(h.recs, rec)
+	return nil
 }
 
+// WithAttrs 派生时忽略绑定属性（引擎不使用 logger.With，测试用不到）。
+func (h *recordingHandler) WithAttrs([]slog.Attr) slog.Handler { return h }
+
+// WithGroup 派生时忽略分组（引擎不使用分组，测试用不到）。
+func (h *recordingHandler) WithGroup(string) slog.Handler { return h }
+
+func (h *recordingHandler) Close() error { return nil }
+
 // find 返回第一条 msg 匹配的记录；不存在返回 nil。
-func (r *recordingLogger) find(msg string) *logRecord {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	for i := range r.recs {
-		if r.recs[i].msg == msg {
-			return &r.recs[i]
+func (h *recordingHandler) find(msg string) *logRecord {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	for i := range h.recs {
+		if h.recs[i].msg == msg {
+			return &h.recs[i]
 		}
 	}
 	return nil
 }
 
 // countMsg 统计 msg 匹配的记录条数。
-func (r *recordingLogger) countMsg(msg string) int {
-	r.mu.Lock()
-	defer r.mu.Unlock()
+func (h *recordingHandler) countMsg(msg string) int {
+	h.mu.Lock()
+	defer h.mu.Unlock()
 	n := 0
-	for i := range r.recs {
-		if r.recs[i].msg == msg {
+	for i := range h.recs {
+		if h.recs[i].msg == msg {
 			n++
 		}
 	}
 	return n
 }
 
-func (r *recordingLogger) reset() {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	r.recs = nil
+func (h *recordingHandler) reset() {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.recs = nil
 }
 
-// newLoggerEngine 构造注入 recordingLogger 的同步引擎。
-func newLoggerEngine(t *testing.T, clk clock.Clock, logger observ.Logger) (*Engine, *memory.Store) {
+// msgsOf 返回全部 msg（调试输出用）。
+func (h *recordingHandler) msgsOf() []string {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	out := make([]string, 0, len(h.recs))
+	for i := range h.recs {
+		out = append(out, h.recs[i].msg)
+	}
+	return out
+}
+
+// newLoggerEngine 构造注入 recordingHandler 支撑 *slog.Logger 的同步引擎。
+func newLoggerEngine(t *testing.T, clk clock.Clock, logger *slog.Logger) (*Engine, *memory.Store) {
 	t.Helper()
 	s := memory.New()
 	e := NewEngine(s, WithClock(clk), WithLogger(logger))
@@ -78,26 +102,26 @@ func newLoggerEngine(t *testing.T, clk clock.Clock, logger observ.Logger) (*Engi
 }
 
 // waitLogCount 轮询直到指定 msg 的日志条数达到 want（配合 FakeClock 的异步唤醒）。
-func waitLogCount(t *testing.T, logger *recordingLogger, msg string, want int) {
+func waitLogCount(t *testing.T, h *recordingHandler, msg string, want int) {
 	t.Helper()
 	deadline := time.Now().Add(time.Second)
 	for {
-		if logger.countMsg(msg) >= want {
+		if h.countMsg(msg) >= want {
 			return
 		}
 		if time.Now().After(deadline) {
-			t.Fatalf("timeout waiting %dx %q, got %v", want, msg, logger.countMsg(msg))
+			t.Fatalf("timeout waiting %dx %q, got %v", want, msg, h.countMsg(msg))
 		}
 		time.Sleep(time.Millisecond)
 	}
 }
 
-// 生命周期日志：引擎启动/停止、run 启动/挂起/信号等低频事件必须经 observ.Logger
-// 输出（Info 级），且不得影响执行语义。
+// 生命周期日志：引擎启动/停止、run 启动/挂起/信号等低频事件必须经
+// *slog.Logger 输出（Info 级），且不得影响执行语义。
 func TestLifecycleLogs(t *testing.T) {
 	clk := clock.NewFakeClock()
-	logger := &recordingLogger{}
-	e, _ := newLoggerEngine(t, clk, logger)
+	h := &recordingHandler{}
+	e, _ := newLoggerEngine(t, clk, slog.New(h))
 
 	e.Register("w", func(wf *WorkflowContext) error {
 		if err := wf.Sleep(10*time.Second, WithLabel("nap")); err != nil {
@@ -113,13 +137,13 @@ func TestLifecycleLogs(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if logger.find("engine: run started") == nil {
+	if h.find("engine: run started") == nil {
 		t.Fatal("missing run started log")
 	}
 
 	// 推进时钟唤醒 Sleep，进入 Await 挂起（异步唤醒，轮询日志确认）。
 	clk.Advance(10 * time.Second)
-	waitLogCount(t, logger, "engine: run awaiting", 1)
+	waitLogCount(t, h, "engine: run awaiting", 1)
 
 	// 投递信号：run 消费信号完成，应记录 signal received。
 	if err := e.Signal(context.Background(), rid, "go", nil); err != nil {
@@ -129,7 +153,7 @@ func TestLifecycleLogs(t *testing.T) {
 	if m.Status != model.StatusSucceeded {
 		t.Fatalf("status=%s err=%s", m.Status, m.Err)
 	}
-	if logger.find("engine: signal received") == nil {
+	if h.find("engine: signal received") == nil {
 		t.Fatal("missing signal received log")
 	}
 
@@ -146,13 +170,13 @@ func TestLifecycleLogs(t *testing.T) {
 		"engine: run completed",
 		"engine: stopped",
 	} {
-		if logger.find(msg) == nil {
-			t.Fatalf("missing lifecycle log %q, got %v", msg, logger.msgsOf())
+		if h.find(msg) == nil {
+			t.Fatalf("missing lifecycle log %q, got %v", msg, h.msgsOf())
 		}
 	}
 	// 同一实例可多次挂起（Sleep 与 Await）：必须以不同 message 区分，
 	// 且顺序为先 sleeping 后 awaiting（仅靠 deadline 区分易误读）。
-	all := logger.msgsOf()
+	all := h.msgsOf()
 	idxSleep, idxAwait := -1, -1
 	for i, m := range all {
 		switch m {
@@ -169,17 +193,17 @@ func TestLifecycleLogs(t *testing.T) {
 	// start（Start 投递）→ timer（FakeClock 推进唤醒）→ signal（Signal 投递）。
 	wantSources := []string{"start", "timer", "signal"}
 	var gotSources []string
-	logger.mu.Lock()
-	for i := range logger.recs {
-		if logger.recs[i].msg == "engine: run dispatched" {
-			for _, a := range logger.recs[i].attrs {
+	h.mu.Lock()
+	for i := range h.recs {
+		if h.recs[i].msg == "engine: run dispatched" {
+			for _, a := range h.recs[i].attrs {
 				if a.Key == "source" {
 					gotSources = append(gotSources, a.Value.String())
 				}
 			}
 		}
 	}
-	logger.mu.Unlock()
+	h.mu.Unlock()
 	if !reflect.DeepEqual(gotSources, wantSources) {
 		t.Fatalf("dispatch sources = %v, want %v", gotSources, wantSources)
 	}
@@ -189,8 +213,8 @@ func TestLifecycleLogs(t *testing.T) {
 // nil 却无法得知信号未生效。
 func TestSignalIgnoredDebugLog(t *testing.T) {
 	clk := clock.NewFakeClock()
-	logger := &recordingLogger{}
-	e, _ := newLoggerEngine(t, clk, logger)
+	h := &recordingHandler{}
+	e, _ := newLoggerEngine(t, clk, slog.New(h))
 
 	e.Register("w", func(wf *WorkflowContext) error {
 		return nil
@@ -205,7 +229,7 @@ func TestSignalIgnoredDebugLog(t *testing.T) {
 	if err := e.Signal(context.Background(), rid, "late", nil); err != nil {
 		t.Fatal(err)
 	}
-	rec := logger.find("engine: signal ignored, run already terminal")
+	rec := h.find("engine: signal ignored, run already terminal")
 	if rec == nil || rec.level != slog.LevelDebug {
 		t.Fatalf("ignored signal log = %+v, want Debug level", rec)
 	}
@@ -217,8 +241,8 @@ func TestSignalIgnoredDebugLog(t *testing.T) {
 // 失败事件必须以 Error 级输出（run failed）。
 func TestFailureErrorLog(t *testing.T) {
 	clk := clock.NewFakeClock()
-	logger := &recordingLogger{}
-	e, _ := newLoggerEngine(t, clk, logger)
+	h := &recordingHandler{}
+	e, _ := newLoggerEngine(t, clk, slog.New(h))
 
 	e.Register("w", func(wf *WorkflowContext) error {
 		return errors.New("boom")
@@ -232,7 +256,7 @@ func TestFailureErrorLog(t *testing.T) {
 	if m.Status != model.StatusFailed {
 		t.Fatalf("status=%s want failed", m.Status)
 	}
-	rec := logger.find("engine: run failed")
+	rec := h.find("engine: run failed")
 	if rec == nil || rec.level != slog.LevelError {
 		t.Fatalf("run failed log = %+v, want Error level", rec)
 	}
@@ -245,8 +269,8 @@ func TestFailureErrorLog(t *testing.T) {
 // 供确定性调试（设计文档 12.1）。
 func TestReplayDebugLog(t *testing.T) {
 	clk := clock.NewFakeClock()
-	logger := &recordingLogger{}
-	e, s := newLoggerEngine(t, clk, logger)
+	h := &recordingHandler{}
+	e, s := newLoggerEngine(t, clk, slog.New(h))
 
 	e.Register("w", func(wf *WorkflowContext) error {
 		if err := wf.Sleep(10*time.Second, WithLabel("nap")); err != nil {
@@ -263,13 +287,13 @@ func TestReplayDebugLog(t *testing.T) {
 	waitFor(t, e, rid, time.Second) // 首次执行完成（sleep 命中后正常返回）
 
 	// 模拟崩溃后重启：终态实例重置为 Running 后重放（同 determinism 测试模式）。
-	logger.reset()
+	h.reset()
 	if err := s.UpdateStatus(context.Background(), rid, model.StatusRunning); err != nil {
 		t.Fatal(err)
 	}
 	e.run(context.Background(), rid, srcManual)
 
-	rec := logger.find("engine: run replaying")
+	rec := h.find("engine: run replaying")
 	if rec == nil || rec.level != slog.LevelDebug {
 		t.Fatalf("replaying log = %+v, want Debug level", rec)
 	}
@@ -289,47 +313,27 @@ func TestReplayDebugLog(t *testing.T) {
 	}
 }
 
-// msgsOf 返回全部 msg（调试输出用）。
-func (r *recordingLogger) msgsOf() []string {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	out := make([]string, 0, len(r.recs))
-	for i := range r.recs {
-		out = append(out, r.recs[i].msg)
-	}
-	return out
-}
-
-// 默认 logger 快照语义：未注入 WithLogger 时，NewEngine 构造期读取
-// observ.DefaultLogger() 并固定——构造前 SetDefaultLogger 的值生效；
-// 构造后再替换包级默认不再影响本引擎。未设置时为 NoopLogger（零输出），
-// 引擎绝不默认向 slog.Default() 输出（库不应产生意外的 stderr 噪声）。
-func TestDefaultLoggerSnapshot(t *testing.T) {
-	logger := &recordingLogger{}
-	old := observ.SetDefaultLogger(logger)
-	defer observ.SetDefaultLogger(old)
-
+// 默认日志出口静默：未注入 WithLogger 时引擎使用 slog.DiscardHandler（零
+// 输出）——库绝不默认向 slog.Default() 输出（不应产生意外的 stderr 噪声）；
+// WithLogger(nil) 与未注入等价，不覆盖缺省值。
+func TestDefaultLoggerSilent(t *testing.T) {
 	s := memory.New()
-	e := NewEngine(s, WithClock(clock.NewFakeClock()))
+	e := NewEngine(s, WithClock(clock.NewFakeClock()), WithLogger(nil))
 	e.SetTestOptions(TestOptions{RunSync: true, NoAutoRecover: true})
 	defer e.Stop(context.Background())
 
-	e.Register("w", func(wf *WorkflowContext) error { return nil })
-	if _, err := e.Start(context.Background(), "w", nil); err != nil {
-		t.Fatal(err)
-	}
-	if logger.find("engine: run started") == nil {
-		t.Fatal("engine must snapshot observ.DefaultLogger() at construction: pre-set default logger not used")
+	if e.logger.Handler() != slog.DiscardHandler {
+		t.Fatalf("default logger must be discard (silent), got %T", e.logger.Handler())
 	}
 
-	// 构造后再替换包级默认：本引擎已固定快照，继续向构造期 logger 输出、
-	// 不受新默认影响（若动态读取默认值，记录会改道 NoopLogger 而 recorder 归零）。
-	logger.reset()
-	observ.SetDefaultLogger(observ.NoopLogger)
-	if _, err := e.Start(context.Background(), "w", nil); err != nil {
+	// 静默 logger 下工作流照常执行：观测缺失不得影响执行语义。
+	e.Register("w", func(wf *WorkflowContext) error { return nil })
+	rid, err := e.Start(context.Background(), "w", nil)
+	if err != nil {
 		t.Fatal(err)
 	}
-	if logger.find("engine: run started") == nil {
-		t.Fatal("engine snapshot must stay fixed: post-construction SetDefaultLogger must not redirect existing engine logs")
+	m := waitFor(t, e, rid, time.Second)
+	if m.Status != model.StatusSucceeded {
+		t.Fatalf("status=%s err=%s", m.Status, m.Err)
 	}
 }

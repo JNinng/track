@@ -6,7 +6,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/jninng/observ"
 	"github.com/jninng/track/model"
 )
 
@@ -68,18 +67,20 @@ func (s *scheduler) worker() {
 	defer s.wg.Done()
 	for t := range s.queue {
 		// 队列深度为资源状态量：消费侧同样更新，否则排空后指标停留在
-		// 最后一次入队时的水位（只高不低，误导告警口径）。
-		s.engine.metrics.queueDepth.Set(float64(len(s.queue)))
+		// 最后一次入队时的水位（只高不低，误导告警口径）。打点 ctx 用
+		// 引擎自身 ctx（Worker 生命周期与引擎一致）。
+		s.engine.metrics.recordQueueDepth(s.engine.ctx, int64(len(s.queue)))
 		s.engine.run(s.engine.ctx, t.runID, t.source)
 	}
 }
 
 // enqueue 将任务推入队列。队列满时丢弃并记录日志（应通过增大队列避免）。
+// ctx 仅用于观测打点与日志。
 //
 // 注意：检查 stopped 标志与向 queue 发送必须在同一把 stopMu 临界区内完成，
 // 否则 stop() 可能在二者之间 close(s.queue)，导致本方法向已关闭的 channel
 // 发送而 panic。
-func (s *scheduler) enqueue(runID model.RunID, source string) {
+func (s *scheduler) enqueue(ctx context.Context, runID model.RunID, source string) {
 	s.stopMu.Lock()
 	defer s.stopMu.Unlock()
 	if s.stopped {
@@ -93,15 +94,17 @@ func (s *scheduler) enqueue(runID model.RunID, source string) {
 	select {
 	case s.queue <- task{runID: runID, source: source}:
 	default:
-		s.engine.metrics.queueDropped.Inc()
-		logWith(s.engine.logger, slog.LevelWarn, "engine: task queue full, dropping run",
-			slog.String(observ.AttrRunID, string(runID)))
+		s.engine.metrics.add(ctx, s.engine.metrics.queueDropped)
+		logWith(ctx, s.engine.logger, slog.LevelWarn, "engine: task queue full, dropping run",
+			slog.String(AttrRunID, string(runID)))
 	}
 	// 队列深度为资源状态量：无论入队或丢弃都反映当前真实水位。
-	s.engine.metrics.queueDepth.Set(float64(len(s.queue)))
+	s.engine.metrics.recordQueueDepth(ctx, int64(len(s.queue)))
 }
 
-// scheduleWakeup 在 deadline 到达时把 runID 重新推入队列。
+// scheduleWakeup 在 deadline 到达时把 runID 重新推入队列。ctx 仅用于注册
+// 阶段的观测日志；唤醒触发的后续投递在后台 goroutine 中进行，绑定引擎自身
+// ctx（调用方 ctx 生命周期不覆盖定时器触发时刻）。
 //
 // 使用注入的时钟：RealClock 下到达真实 deadline 时触发；FakeClock 下
 // 通过 clock.Advance 推进时间触发，便于确定性测试。
@@ -110,44 +113,38 @@ func (s *scheduler) enqueue(runID model.RunID, source string) {
 // 注意：timer 通道必须在同步阶段注册（而非在 goroutine 内），否则
 // FakeClock 的 Advance 可能先于注册发生，导致 deadline 相对已推进的
 // 时刻重新计算，破坏确定性。
-func (s *scheduler) scheduleWakeup(runID model.RunID, deadline time.Time) {
+func (s *scheduler) scheduleWakeup(ctx context.Context, runID model.RunID, deadline time.Time) {
 	if deadline.IsZero() {
 		return
 	}
-	// 唤醒调度是确定性关键路径（deadline 锚定）：注册前记录一次（Debug，门控）。
-	if s.engine.logger.Enabled(slog.LevelDebug) {
-		logWith(s.engine.logger, slog.LevelDebug, "engine: wakeup scheduled",
-			slog.String(observ.AttrRunID, string(runID)),
-			slog.Time("deadline", deadline))
-	}
+	// 唤醒调度是确定性关键路径（deadline 锚定）：注册前记录一次（Debug）。
+	logWith(ctx, s.engine.logger, slog.LevelDebug, "engine: wakeup scheduled",
+		slog.String(AttrRunID, string(runID)),
+		slog.Time("deadline", deadline))
 	remaining := deadline.Sub(s.engine.clock.Now())
 	if remaining <= 0 {
 		// 已到期：立即重投。经 goroutine 异步执行——RunSync 模式下当前 run
 		// 仍持有锁，同步重入会因 Acquire 失败而丢失本次唤醒；异步也与
 		// 定时器触发路径（goroutine 内 dispatch）保持一致。
-		if s.engine.logger.Enabled(slog.LevelDebug) {
-			logWith(s.engine.logger, slog.LevelDebug, "engine: wakeup fired",
-				slog.String(observ.AttrRunID, string(runID)))
-		}
-		go s.engine.dispatch(runID, srcTimer)
+		logWith(ctx, s.engine.logger, slog.LevelDebug, "engine: wakeup fired",
+			slog.String(AttrRunID, string(runID)))
+		go s.engine.dispatch(s.engine.ctx, runID, srcTimer)
 		return
 	}
 
 	// 同步注册定时器通道，确保 deadline 锚定在当前时刻。
 	timerCh := s.engine.clock.After(remaining)
-	ctx, cancel := context.WithCancel(s.engine.ctx)
+	timerCtx, cancel := context.WithCancel(s.engine.ctx)
 	h := &timerHandle{cancel: cancel}
 	s.registerTimer(runID, h)
 	go func() {
 		defer s.clearTimerIf(runID, h)
 		select {
 		case <-timerCh:
-			if s.engine.logger.Enabled(slog.LevelDebug) {
-				logWith(s.engine.logger, slog.LevelDebug, "engine: wakeup fired",
-					slog.String(observ.AttrRunID, string(runID)))
-			}
-			s.engine.dispatch(runID, srcTimer)
-		case <-ctx.Done():
+			logWith(s.engine.ctx, s.engine.logger, slog.LevelDebug, "engine: wakeup fired",
+				slog.String(AttrRunID, string(runID)))
+			s.engine.dispatch(s.engine.ctx, runID, srcTimer)
+		case <-timerCtx.Done():
 		}
 	}()
 }

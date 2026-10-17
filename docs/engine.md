@@ -22,7 +22,7 @@
 │   scheduler.go Worker Pool / TaskQueue / 唤醒定时器          │
 │   waiters.go   WaitDone 等待者注册表（进程内观测旁路）        │
 │   errors.go    哨兵错误   options.go  选项   workflow.go 注册 │
-│   metrics.go   指标句柄（observ.Meter）   testing.go 测试钩子 │
+│   metrics.go   指标句柄（otel metric.Meter）testing.go 测试钩子 │
 └───────────────────────────▲─────────────────────────────────┘
                             │ 仅依赖接口（store.Interface）
 ┌───────────────────────────┴─────────────────────────────────┐
